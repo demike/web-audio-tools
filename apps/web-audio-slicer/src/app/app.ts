@@ -1,14 +1,20 @@
-import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
+import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { AudioSlicerService, Track, SilenceSegment, SlicerState } from './audio-slicer.service';
 import {
+  PromptApiDiagnostics,
+  PromptApiStatus,
   TRANSCRIPTION_LANGUAGE_OPTIONS,
   TranscriptionLanguageCode,
   TranscriptionService
 } from './transcription.service';
 import { WebMcpService } from './webmcp.service';
 import { Subscription } from 'rxjs';
+
+type ModelContextCapable = {
+  modelContext?: unknown;
+};
 
 @Component({
   selector: 'app-root',
@@ -41,9 +47,15 @@ export class App implements OnInit, OnDestroy {
   public minSilenceDuration = 2.5;
   public minSongDuration = 8.0;
   public mp3Bitrate = 192;
+  public transcribeSpeechGapsOnStart = true;
+  public trackStartIndex = 1;
 
   // UI status
-  public chromeAIAvailable = false;
+  public promptApiDiagnostics: PromptApiDiagnostics = {
+    status: 'unsupported',
+    detail: 'Prompt API status not checked yet.',
+    lastError: null
+  };
   public webMcpStatus: 'unsupported' | 'active' = 'unsupported';
   public showSettings = false;
   public isDragOver = false;
@@ -55,14 +67,11 @@ export class App implements OnInit, OnDestroy {
   public editingTrackId: number | null = null;
   public editingTitle = '';
 
+  private readonly audioSlicerService = inject(AudioSlicerService);
+  private readonly transcriptionService = inject(TranscriptionService);
+  private readonly webMcpService = inject(WebMcpService);
+  private readonly cdr = inject(ChangeDetectorRef);
   private subs: Subscription[] = [];
-
-  constructor(
-    private audioSlicerService: AudioSlicerService,
-    private transcriptionService: TranscriptionService,
-    private webMcpService: WebMcpService,
-    private cdr: ChangeDetectorRef
-  ) {}
 
   public async ngOnInit(): Promise<void> {
     // 1. Load settings from localStorage
@@ -87,6 +96,10 @@ export class App implements OnInit, OnDestroy {
         this.segments = seg;
         this.cdr.markForCheck();
       }),
+      this.transcriptionService.promptApiDiagnostics$.subscribe(diagnostics => {
+        this.promptApiDiagnostics = diagnostics;
+        this.cdr.markForCheck();
+      }),
       this.audioSlicerService.volumeLevel$.subscribe(db => {
         // Shift history and append new value
         this.volumeHistory.shift();
@@ -97,9 +110,13 @@ export class App implements OnInit, OnDestroy {
 
     // 3. AI Support detection and WebMCP registration (Browser-only)
     if (typeof window !== 'undefined') {
-      this.chromeAIAvailable = await this.transcriptionService.isChromeAIAvailable();
-      
-      const hasModelContext = !!((navigator as any).modelContext || (document as any).modelContext);
+      await this.transcriptionService.refreshPromptApiDiagnostics();
+
+      const hasModelContext = Boolean(
+        (navigator as Navigator & ModelContextCapable).modelContext
+        || (document as Document & ModelContextCapable).modelContext
+      );
+
       if (hasModelContext) {
         this.webMcpService.registerWebMcpTools();
         this.webMcpStatus = 'active';
@@ -120,6 +137,27 @@ export class App implements OnInit, OnDestroy {
     this.audioSlicerService.minSongDuration = Number(this.minSongDuration);
     this.audioSlicerService.mp3Bitrate = Number(this.mp3Bitrate);
     this.showSettings = false;
+    if (typeof window !== 'undefined') {
+      void this.transcriptionService.refreshPromptApiDiagnostics();
+    }
+  }
+
+  public getPromptApiStatusLabel(status: PromptApiStatus): string {
+    switch (status) {
+      case 'available':
+      case 'downloadable':
+      case 'downloading':
+      case 'unavailable':
+      case 'unsupported':
+        return status;
+      case 'error':
+      default:
+        return 'runtime error';
+    }
+  }
+
+  public get hasGeminiFallbackConfigured(): boolean {
+    return this.apiKey.trim().length > 0;
   }
 
   // --- Drag & Drop / File Handling ---
@@ -162,7 +200,10 @@ export class App implements OnInit, OnDestroy {
     this.saveSettings();
 
     try {
-      await this.audioSlicerService.sliceWavFile(this.file);
+      await this.audioSlicerService.sliceWavFile(this.file, {
+        transcribeSpeechGaps: this.transcribeSpeechGapsOnStart,
+        trackStartIndex: this.trackStartIndex
+      });
     } catch (e) {
       console.error(e);
       alert('Slicing failed: ' + (e as Error).message);

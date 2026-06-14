@@ -27,13 +27,5 @@
         "{workspaceRoot}/tools/eslint-rules/**/*"
       ]
     }
-  },
-  "generators": {
-    "@nx/angular:application": {
-      "e2eTestRunner": "none",
-      "linter": "eslint",
-      "style": "css",
-      "unitTestRunner": "none"
-    }
   }
 }

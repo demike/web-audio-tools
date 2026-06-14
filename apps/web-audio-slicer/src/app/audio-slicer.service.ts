@@ -1,11 +1,12 @@
-import { Injectable } from '@angular/core';
-import { BehaviorSubject, Observable, Subject } from 'rxjs';
+import { Injectable, inject } from '@angular/core';
+import { BehaviorSubject, Subject } from 'rxjs';
 import { WavStreamParser, calculateRms, rmsToDb, createWavBlob } from './audio-helper';
 import { TranscriptionService } from './transcription.service';
 
 export interface Track {
   id: number;
   title: string;
+  titleSource: 'default' | 'transcription' | 'metadata' | 'manual';
   startTime: number;
   endTime: number;
   duration: number;
@@ -21,7 +22,7 @@ export interface SilenceSegment {
   endTime: number;
   duration: number;
   text: string | null;
-  status: 'idle' | 'transcribing' | 'done' | 'failed';
+  status: 'idle' | 'transcribing' | 'done' | 'skipped' | 'failed';
 }
 
 export interface SlicerState {
@@ -33,6 +34,11 @@ export interface SlicerState {
   dbLevel: number;
   currentTrackId: number | null;
   currentStateName: 'SILENCE' | 'SONG';
+}
+
+export interface SliceOptions {
+  transcribeSpeechGaps?: boolean;
+  trackStartIndex?: number;
 }
 
 @Injectable({
@@ -70,10 +76,7 @@ export class AudioSlicerService {
   private workerQueueDepth = 0;
   private workerCapacityWaiters: Array<() => void> = [];
   private readonly maxWorkerQueueDepth = 8;
-
-  constructor(
-    private transcriptionService: TranscriptionService
-  ) {}
+  private readonly transcriptionService = inject(TranscriptionService);
 
   public getTracksValue(): Track[] {
     return this.tracks.getValue();
@@ -83,9 +86,9 @@ export class AudioSlicerService {
     return this.segments.getValue();
   }
 
-  public updateTrackTitle(trackId: number, title: string): void {
+  public updateTrackTitle(trackId: number, title: string, titleSource: Track['titleSource'] = 'manual'): void {
     const currentTracks = this.tracks.getValue();
-    const updatedTracks = currentTracks.map(t => t.id === trackId ? { ...t, title } : t);
+    const updatedTracks = currentTracks.map(t => t.id === trackId ? { ...t, title, titleSource } : t);
     this.tracks.next(updatedTracks);
   }
 
@@ -120,13 +123,16 @@ export class AudioSlicerService {
   /**
    * Main slicing entry point. Streams a WAV file and splits it.
    */
-  public async sliceWavFile(file: File): Promise<void> {
+  public async sliceWavFile(file: File, options: SliceOptions = {}): Promise<void> {
     this.reset();
     this.state.next({
       ...this.state.getValue(),
       status: 'slicing',
       fileName: file.name
     });
+
+    const transcribeSpeechGaps = options.transcribeSpeechGaps ?? true;
+    const trackStartIndex = this.normalizeTrackStartIndex(options.trackStartIndex);
 
     // Estimate duration: 16-bit stereo 44.1kHz WAV has ~176400 bytes/sec
     const bytesPerSecond = 44100 * 2 * 2;
@@ -149,7 +155,7 @@ export class AudioSlicerService {
     let totalSamplesProcessed = 0;
     
     // Song accumulation worker state
-    let songTrackCounter = 0;
+    let songTrackCounter = trackStartIndex - 1;
     let currentSongTrack: Track | null = null;
     let songStartSec = 0;
     const getCurrentSongTrack = (): Track | null => currentSongTrack;
@@ -231,14 +237,12 @@ export class AudioSlicerService {
                 status: 'transcribing'
               };
 
-              const current = this.segments.getValue();
-              this.segments.next([...current, segment]);
-
-              this.transcribeSegmentInBackground(
+              this.registerSilenceSegment(
                 segment,
                 this.mergeChannelChunks(currentSilenceBuffer),
                 sampleRate,
-                songTrackCounter + 1
+                songTrackCounter + 1,
+                transcribeSpeechGaps
               );
             }
           }
@@ -250,6 +254,7 @@ export class AudioSlicerService {
           currentSongTrack = {
             id: songTrackCounter,
             title: `Track ${songTrackCounter}`,
+            titleSource: 'default',
             startTime: songStartSec,
             endTime: 0,
             duration: 0,
@@ -259,14 +264,15 @@ export class AudioSlicerService {
             status: 'encoding'
           };
 
+          const newTrack = currentSongTrack;
           const current = this.tracks.getValue();
-          this.tracks.next([...current, currentSongTrack!]);
+          this.tracks.next([...current, newTrack]);
           this.state.next({
             ...this.state.getValue(),
-            currentTrackId: currentSongTrack!.id
+            currentTrackId: newTrack.id
           });
 
-          this.initMp3Worker(this.getMp3ExportChannelCount(numChannels), sampleRate, currentSongTrack.id);
+          this.initMp3Worker(this.getMp3ExportChannelCount(numChannels), sampleRate, newTrack.id);
           this.feedSamplesToWorker(windowChannels);
         } else {
           if (currentSilenceBuffer.length === 0) {
@@ -299,7 +305,7 @@ export class AudioSlicerService {
             if (songDuration >= this.minSongDuration && currentSongTrack) {
               currentSongTrack.endTime = songEndSec;
               currentSongTrack.duration = songDuration;
-              this.finishMp3Worker(currentSongTrack.id);
+              this.finishMp3Worker();
             } else if (currentSongTrack) {
               this.discardCurrentTrack(currentSongTrack.id);
             }
@@ -417,7 +423,7 @@ export class AudioSlicerService {
         
         openSongTrack.endTime = currentTime;
         openSongTrack.duration = currentTime - songStartSec;
-        this.finishMp3Worker(openSongTrack.id);
+        this.finishMp3Worker();
       } else if (currentState === 'SILENCE' && this.hasChannelChunks(currentSilenceBuffer)) {
         // Transcribe final silence segment
         const silenceDuration = currentTime - silenceStartSec;
@@ -432,14 +438,12 @@ export class AudioSlicerService {
             status: 'transcribing'
           };
 
-          const current = this.segments.getValue();
-          this.segments.next([...current, segment]);
-
-          this.transcribeSegmentInBackground(
+          this.registerSilenceSegment(
             segment,
             this.mergeChannelChunks(currentSilenceBuffer),
             sampleRate,
-            songTrackCounter + 1
+            songTrackCounter + 1,
+            transcribeSpeechGaps
           );
         }
       }
@@ -691,7 +695,7 @@ export class AudioSlicerService {
     }
   }
 
-  private finishMp3Worker(trackId: number): void {
+  private finishMp3Worker(): void {
     if (this.activeWorker) {
       this.activeWorker.postMessage({ command: 'finish' });
       this.activeWorker = null; // Let the onmessage handler finish and terminate it
@@ -765,6 +769,39 @@ export class AudioSlicerService {
     return [mono];
   }
 
+  private registerSilenceSegment(
+    segment: SilenceSegment,
+    pcmBuffer: Float32Array[],
+    sampleRate: number,
+    targetTrackId: number,
+    transcribeSpeechGaps: boolean
+  ): void {
+    const nextSegment = transcribeSpeechGaps
+      ? segment
+      : {
+          ...segment,
+          status: 'skipped' as const,
+          text: 'Transcription disabled for this analysis run.'
+        };
+
+    const currentSegments = this.segments.getValue();
+    this.segments.next([...currentSegments, nextSegment]);
+
+    if (!transcribeSpeechGaps) {
+      return;
+    }
+
+    this.transcribeSegmentInBackground(nextSegment, pcmBuffer, sampleRate, targetTrackId);
+  }
+
+  private normalizeTrackStartIndex(value: number | undefined): number {
+    if (!Number.isFinite(value)) {
+      return 1;
+    }
+
+    return Math.max(1, Math.floor(value ?? 1));
+  }
+
   // --- Transcription and AI Refinement ---
   private transcribeSegmentInBackground(
     segment: SilenceSegment,
@@ -772,11 +809,41 @@ export class AudioSlicerService {
     sampleRate: number,
     targetTrackId: number
   ): void {
-    // 1. Encode PCM to WAV blob
-    const wavBlob = createWavBlob(pcmBuffer, sampleRate);
-    
-    this.transcriptionService.transcribeAudio(wavBlob)
+    this.transcriptionService.hasTranscriptionProvider()
+      .then(hasProvider => {
+        if (!hasProvider) {
+          const currentSegments = this.segments.getValue();
+          const updatedSegments = currentSegments.map(s =>
+            s.id === segment.id
+              ? {
+                  ...s,
+                  status: 'skipped' as const,
+                  text: 'Transcription skipped: no Prompt API or Gemini API key is available.'
+                }
+              : s
+          );
+          this.segments.next(updatedSegments);
+          return null;
+        }
+
+        return this.transcriptionService.transcribeAudio(createWavBlob(pcmBuffer, sampleRate));
+      })
       .then(async text => {
+        if (text === null) {
+          const currentSegments = this.segments.getValue();
+          const updatedSegments = currentSegments.map(s =>
+            s.id === segment.id
+              ? {
+                  ...s,
+                  status: 'skipped' as const,
+                  text: 'Transcription skipped: Prompt API could not be used and no Gemini API key is configured.'
+                }
+              : s
+          );
+          this.segments.next(updatedSegments);
+          return;
+        }
+
         const currentSegments = this.segments.getValue();
         const updatedSegments = currentSegments.map(s => 
           s.id === segment.id ? { ...s, text, status: 'done' as const } : s
@@ -791,7 +858,7 @@ export class AudioSlicerService {
 
         const extractedTitle = await this.transcriptionService.extractSongTitle(text);
         if (extractedTitle) {
-          this.updateTrackTitle(targetTrackId, extractedTitle);
+          this.updateTrackTitle(targetTrackId, extractedTitle.title, extractedTitle.source);
         }
       })
       .catch(err => {

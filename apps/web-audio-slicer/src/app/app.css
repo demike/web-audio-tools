@@ -79,6 +79,18 @@
   color: var(--color-success);
 }
 
+.badge-warning {
+  background: rgba(245, 158, 11, 0.08);
+  border-color: rgba(245, 158, 11, 0.25);
+  color: var(--color-accent);
+}
+
+.badge-error {
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.25);
+  color: var(--color-danger);
+}
+
 /* Settings button & drawer */
 .settings-btn {
   display: flex;
@@ -157,7 +169,8 @@
   gap: 8px;
 }
 
-.setting-item label {
+.setting-item label,
+.setting-item-title {
   font-size: 0.8rem;
   font-weight: 600;
   color: var(--text-main);
@@ -226,6 +239,34 @@
 .help-text {
   font-size: 0.75rem;
   color: var(--text-dark);
+}
+
+.prompt-diagnostic-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.prompt-diagnostic-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.prompt-diagnostic-label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.prompt-diagnostic-meta {
+  margin-top: -2px;
 }
 
 .settings-actions {
@@ -330,6 +371,58 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.analysis-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 0.82rem;
+  color: var(--text-main);
+  cursor: pointer;
+  line-height: 1.4;
+}
+
+.analysis-option input {
+  margin-top: 2px;
+  accent-color: var(--color-primary);
+}
+
+.analysis-option-help {
+  margin-top: -2px;
+}
+
+.analysis-option-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.analysis-option-index {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-main);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.analysis-index-input-wrapper input {
+  width: 100%;
+  padding: 12px 14px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  color: var(--text-main);
+  font-family: var(--font-primary);
+  font-size: 0.9rem;
+  outline: none;
+  transition: all 0.2s ease;
+}
+
+.analysis-index-input-wrapper input:focus {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 10px rgba(139, 92, 246, 0.15);
+  background: rgba(0, 0, 0, 0.4);
 }
 
 .file-info-row {
@@ -981,6 +1074,11 @@
   color: var(--color-accent);
 }
 
+.tag-warning {
+  background: rgba(245, 158, 11, 0.08);
+  color: var(--color-accent);
+}
+
 .tag-done {
   background: rgba(16, 185, 129, 0.08);
   color: var(--color-success);
@@ -992,10 +1090,11 @@
 }
 
 .transcript-cell {
-  max-width: 350px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  min-width: 320px;
+  max-width: 720px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
 }
 
 .text-dark-italic {
@@ -1006,6 +1105,9 @@
 .text-transcript {
   color: var(--text-main);
   font-style: italic;
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .text-ellipsis {

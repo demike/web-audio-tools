@@ -14,9 +14,15 @@
     </div>
     
     <div class="header-badges">
-      <div class="badge" [class.badge-active]="chromeAIAvailable" title="Chrome Prompt API">
+      <div
+        class="badge"
+        [class.badge-active]="promptApiDiagnostics.status === 'available'"
+        [class.badge-warning]="promptApiDiagnostics.status === 'downloadable' || promptApiDiagnostics.status === 'downloading'"
+        [class.badge-error]="promptApiDiagnostics.status === 'unavailable' || promptApiDiagnostics.status === 'unsupported' || promptApiDiagnostics.status === 'error'"
+        [title]="promptApiDiagnostics.lastError || promptApiDiagnostics.detail"
+      >
         <i class="fa-solid fa-brain"></i>
-        <span>Prompt API: {{ chromeAIAvailable ? 'Available' : 'Unavailable' }}</span>
+        <span>Prompt API: {{ getPromptApiStatusLabel(promptApiDiagnostics.status) }}</span>
       </div>
       
       <div class="badge" [class.badge-active]="webMcpStatus === 'active'" title="Model Context Protocol Integration">
@@ -32,109 +38,148 @@
   </header>
 
   <!-- Settings Configuration Area -->
-  <div class="settings-drawer glass-panel" *ngIf="showSettings">
-    <div class="settings-header">
-      <h3><i class="fa-solid fa-gears text-purple"></i> Slicer & API Configuration</h3>
-      <button class="close-btn" (click)="showSettings = false"><i class="fa-solid fa-xmark"></i></button>
+  @if (showSettings) {
+    <div class="settings-drawer glass-panel">
+      <div class="settings-header">
+        <h3><i class="fa-solid fa-gears text-purple"></i> Slicer & API Configuration</h3>
+        <button class="close-btn" (click)="showSettings = false"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+      
+      <div class="settings-grid">
+        <div class="setting-item">
+          <label for="gemini-key">Gemini Developer API Key</label>
+          <div class="input-wrapper">
+            <i class="fa-solid fa-key icon-left"></i>
+            <input 
+              type="password" 
+              id="gemini-key" 
+              [(ngModel)]="apiKey" 
+              placeholder="AIzaSy... (Enables audio transcription)" 
+            />
+          </div>
+          <p class="help-text">Optional fallback when the browser Prompt API is unavailable. No fake transcripts are generated.</p>
+        </div>
+
+        <div class="setting-item">
+          <div class="setting-item-title">Prompt API Diagnostics</div>
+          <div class="prompt-diagnostic-card">
+            <div class="prompt-diagnostic-row">
+              <span class="prompt-diagnostic-label">Audio Prompt API status</span>
+              <span
+                class="seg-status-tag"
+                [class.tag-done]="promptApiDiagnostics.status === 'available'"
+                [class.tag-warning]="promptApiDiagnostics.status === 'downloadable' || promptApiDiagnostics.status === 'downloading'"
+                [class.tag-failed]="promptApiDiagnostics.status === 'unavailable' || promptApiDiagnostics.status === 'unsupported' || promptApiDiagnostics.status === 'error'"
+              >
+                <i
+                  class="fa-solid"
+                  [ngClass]="promptApiDiagnostics.status === 'available'
+                    ? 'fa-check'
+                    : (promptApiDiagnostics.status === 'downloadable' || promptApiDiagnostics.status === 'downloading'
+                      ? 'fa-download'
+                      : 'fa-triangle-exclamation')"
+                ></i>
+                {{ getPromptApiStatusLabel(promptApiDiagnostics.status) }}
+              </span>
+            </div>
+
+            <p class="help-text">{{ promptApiDiagnostics.detail }}</p>
+
+            @if (promptApiDiagnostics.lastError) {
+              <p class="help-text text-danger">Last runtime error: {{ promptApiDiagnostics.lastError }}</p>
+            }
+
+            <p class="help-text prompt-diagnostic-meta">
+              Gemini fallback: {{ hasGeminiFallbackConfigured ? 'configured' : 'not configured' }}
+            </p>
+          </div>
+        </div>
+
+        <div class="setting-item">
+          <label for="transcription-language">Transcription Language</label>
+          <div class="input-wrapper">
+            <i class="fa-solid fa-language icon-left"></i>
+            <select id="transcription-language" [(ngModel)]="transcriptionLanguage">
+              @for (option of transcriptionLanguageOptions; track option.value) {
+                <option [value]="option.value">
+                  {{ option.label }}
+                </option>
+              }
+            </select>
+          </div>
+          <p class="help-text">Use Auto detect to keep the spoken language instead of translating everything to English. Transcript text is also searched against MusicBrainz before the app falls back to AI title extraction.</p>
+        </div>
+
+        <div class="setting-item">
+          <label for="threshold">Silence Threshold (dB)</label>
+          <div class="input-wrapper-range">
+            <input 
+              type="range" 
+              id="threshold" 
+              min="-60" 
+              max="-25" 
+              step="1" 
+              [(ngModel)]="thresholdDb" 
+            />
+            <span class="range-value">{{ thresholdDb }} dB</span>
+          </div>
+          <p class="help-text">Volumes below this are considered silent/speech.</p>
+        </div>
+
+        <div class="setting-item">
+          <label for="silence-dur">Min Silence Split (sec)</label>
+          <div class="input-wrapper">
+            <i class="fa-solid fa-hourglass-half icon-left"></i>
+            <input 
+              type="number" 
+              id="silence-dur" 
+              step="0.1" 
+              min="0.5" 
+              max="10.0" 
+              [(ngModel)]="minSilenceDuration" 
+            />
+          </div>
+          <p class="help-text">Gaps must be at least this long to separate tracks.</p>
+        </div>
+
+        <div class="setting-item">
+          <label for="song-dur">Min Song Duration (sec)</label>
+          <div class="input-wrapper">
+            <i class="fa-solid fa-music icon-left"></i>
+            <input 
+              type="number" 
+              id="song-dur" 
+              step="1" 
+              min="2" 
+              max="60" 
+              [(ngModel)]="minSongDuration" 
+            />
+          </div>
+          <p class="help-text">Slices shorter than this will be ignored (e.g. noise).</p>
+        </div>
+
+        <div class="setting-item">
+          <label for="bitrate">MP3 Export Quality (bitrate)</label>
+          <div class="input-wrapper">
+            <i class="fa-solid fa-waveform icon-left"></i>
+            <select id="bitrate" [(ngModel)]="mp3Bitrate">
+              <option [value]="96">96 kbps (Standard Mono)</option>
+              <option [value]="128">128 kbps (Medium Stereo)</option>
+              <option [value]="192">192 kbps (High Quality Stereo)</option>
+              <option [value]="320">320 kbps (Max Quality Stereo)</option>
+            </select>
+          </div>
+          <p class="help-text">Output audio file compression density.</p>
+        </div>
+      </div>
+      
+      <div class="settings-actions">
+        <button class="btn btn-primary" (click)="saveSettings()">
+          <i class="fa-solid fa-check"></i> Save Parameters
+        </button>
+      </div>
     </div>
-    
-    <div class="settings-grid">
-      <div class="setting-item">
-        <label for="gemini-key">Gemini Developer API Key</label>
-        <div class="input-wrapper">
-          <i class="fa-solid fa-key icon-left"></i>
-          <input 
-            type="password" 
-            id="gemini-key" 
-            [(ngModel)]="apiKey" 
-            placeholder="AIzaSy... (Enables audio transcription)" 
-          />
-        </div>
-        <p class="help-text">Optional fallback when the browser Prompt API is unavailable. No fake transcripts are generated.</p>
-      </div>
-
-      <div class="setting-item">
-        <label for="transcription-language">Transcription Language</label>
-        <div class="input-wrapper">
-          <i class="fa-solid fa-language icon-left"></i>
-          <select id="transcription-language" [(ngModel)]="transcriptionLanguage">
-            <option *ngFor="let option of transcriptionLanguageOptions" [value]="option.value">
-              {{ option.label }}
-            </option>
-          </select>
-        </div>
-        <p class="help-text">Use Auto detect to keep the spoken language instead of translating everything to English.</p>
-      </div>
-
-      <div class="setting-item">
-        <label for="threshold">Silence Threshold (dB)</label>
-        <div class="input-wrapper-range">
-          <input 
-            type="range" 
-            id="threshold" 
-            min="-60" 
-            max="-25" 
-            step="1" 
-            [(ngModel)]="thresholdDb" 
-          />
-          <span class="range-value">{{ thresholdDb }} dB</span>
-        </div>
-        <p class="help-text">Volumes below this are considered silent/speech.</p>
-      </div>
-
-      <div class="setting-item">
-        <label for="silence-dur">Min Silence Split (sec)</label>
-        <div class="input-wrapper">
-          <i class="fa-solid fa-hourglass-half icon-left"></i>
-          <input 
-            type="number" 
-            id="silence-dur" 
-            step="0.1" 
-            min="0.5" 
-            max="10.0" 
-            [(ngModel)]="minSilenceDuration" 
-          />
-        </div>
-        <p class="help-text">Gaps must be at least this long to separate tracks.</p>
-      </div>
-
-      <div class="setting-item">
-        <label for="song-dur">Min Song Duration (sec)</label>
-        <div class="input-wrapper">
-          <i class="fa-solid fa-music icon-left"></i>
-          <input 
-            type="number" 
-            id="song-dur" 
-            step="1" 
-            min="2" 
-            max="60" 
-            [(ngModel)]="minSongDuration" 
-          />
-        </div>
-        <p class="help-text">Slices shorter than this will be ignored (e.g. noise).</p>
-      </div>
-
-      <div class="setting-item">
-        <label for="bitrate">MP3 Export Quality (bitrate)</label>
-        <div class="input-wrapper">
-          <i class="fa-solid fa-waveform icon-left"></i>
-          <select id="bitrate" [(ngModel)]="mp3Bitrate">
-            <option [value]="96">96 kbps (Standard Mono)</option>
-            <option [value]="128">128 kbps (Medium Stereo)</option>
-            <option [value]="192">192 kbps (High Quality Stereo)</option>
-            <option [value]="320">320 kbps (Max Quality Stereo)</option>
-          </select>
-        </div>
-        <p class="help-text">Output audio file compression density.</p>
-      </div>
-    </div>
-    
-    <div class="settings-actions">
-      <button class="btn btn-primary" (click)="saveSettings()">
-        <i class="fa-solid fa-check"></i> Save Parameters
-      </button>
-    </div>
-  </div>
+  }
 
   <!-- Dashboard Grid -->
   <main class="dashboard-grid">
@@ -164,59 +209,94 @@
         />
       </div>
 
-      <div class="file-details" *ngIf="file">
-        <div class="file-info-row">
-          <span class="label">Name:</span>
-          <span class="value text-ellipsis" [title]="file.name">{{ file.name }}</span>
-        </div>
-        <div class="file-info-row">
-          <span class="label">Size:</span>
-          <span class="value">{{ (file.size / 1024 / 1024) | number:'1.1-2' }} MB</span>
-        </div>
-        <div class="file-info-row" *ngIf="state.totalDurationEstimate">
-          <span class="label">Est. Duration:</span>
-          <span class="value">{{ formatTime(state.totalDurationEstimate) }}</span>
-        </div>
+      @if (file; as selectedFile) {
+        <div class="file-details">
+          <div class="file-info-row">
+            <span class="label">Name:</span>
+            <span class="value text-ellipsis" [title]="selectedFile.name">{{ selectedFile.name }}</span>
+          </div>
+          <div class="file-info-row">
+            <span class="label">Size:</span>
+            <span class="value">{{ (selectedFile.size / 1024 / 1024) | number:'1.1-2' }} MB</span>
+          </div>
+          @if (state.totalDurationEstimate) {
+            <div class="file-info-row">
+              <span class="label">Est. Duration:</span>
+              <span class="value">{{ formatTime(state.totalDurationEstimate) }}</span>
+            </div>
+          }
 
-        <div class="slicer-actions" [style.margin-top.px]="20">
-          <button 
-            *ngIf="state.status !== 'slicing'" 
-            class="btn btn-primary btn-glow-purple w-full" 
-            (click)="startSlicing()"
-          >
-            <i class="fa-solid fa-scissors"></i> Analyze & Slice Stream
-          </button>
-          
-          <button 
-            *ngIf="state.status === 'slicing'" 
-            class="btn btn-danger btn-glow-red w-full" 
-            (click)="cancelSlicing()"
-          >
-            <i class="fa-solid fa-hand"></i> Stop / Cancel
-          </button>
+          <div class="slicer-actions" [style.margin-top.px]="20">
+            @if (state.status !== 'slicing') {
+              <div class="analysis-option-group">
+                <label class="analysis-option-index" for="track-start-index">Starting track index</label>
+                <div class="analysis-index-input-wrapper">
+                  <input
+                    type="number"
+                    id="track-start-index"
+                    min="1"
+                    step="1"
+                    [(ngModel)]="trackStartIndex"
+                  />
+                </div>
+              </div>
+
+              <label class="analysis-option">
+                <input
+                  type="checkbox"
+                  [(ngModel)]="transcribeSpeechGapsOnStart"
+                />
+                <span>Transcribe speech gaps for automatic track naming</span>
+              </label>
+
+              <p class="help-text analysis-option-help">
+                Disable this to skip all speech transcription for the current analysis run.
+              </p>
+
+              <p class="help-text analysis-option-help">
+                Use a higher starting index when the record continues in another WAV file.
+              </p>
+
+              <button 
+                class="btn btn-primary btn-glow-purple w-full" 
+                (click)="startSlicing()"
+              >
+                <i class="fa-solid fa-scissors"></i> Analyze & Slice Stream
+              </button>
+            } @else {
+              <button 
+                class="btn btn-danger btn-glow-red w-full" 
+                (click)="cancelSlicing()"
+              >
+                <i class="fa-solid fa-hand"></i> Stop / Cancel
+              </button>
+            }
+          </div>
         </div>
-      </div>
-      
-      <div class="no-file-loaded" *ngIf="!file">
-        <i class="fa-solid fa-info-circle text-purple"></i>
-        <span>Upload a WAV file to start slicing. The WAV is parsed as a <strong>Web Stream</strong>, songs are encoded to MP3 in a worker, and quiet intro gaps are transcribed for track naming.</span>
-      </div>
+      } @else {
+        <div class="no-file-loaded">
+          <i class="fa-solid fa-info-circle text-purple"></i>
+          <span>Upload a WAV file to start slicing. The WAV is parsed as a <strong>Web Stream</strong>, songs are encoded to MP3 in a worker, and quiet intro gaps are transcribed for track naming.</span>
+        </div>
+      }
     </section>
 
     <!-- Visualizer / Monitor Panel -->
     <section class="card-panel glass-panel visualizer-section">
       <div class="visualizer-header">
         <h2><i class="fa-solid fa-chart-simple text-purple"></i> Real-time Slicer Monitor</h2>
-        <div class="state-pulse-container" *ngIf="state.status === 'slicing'">
-          <span 
-            class="state-pulse-badge" 
-            [class.badge-song]="state.currentStateName === 'SONG'"
-            [class.badge-silence]="state.currentStateName === 'SILENCE'"
-          >
-            <span class="pulse-dot"></span>
-            {{ state.currentStateName === 'SONG' ? 'DETECTING MUSIC' : 'DETECTING SPEECH' }}
-          </span>
-        </div>
+        @if (state.status === 'slicing') {
+          <div class="state-pulse-container">
+            <span 
+              class="state-pulse-badge" 
+              [class.badge-song]="state.currentStateName === 'SONG'"
+              [class.badge-silence]="state.currentStateName === 'SILENCE'"
+            >
+              <span class="pulse-dot"></span>
+              {{ state.currentStateName === 'SONG' ? 'DETECTING MUSIC' : 'DETECTING SPEECH' }}
+            </span>
+          </div>
+        }
       </div>
 
       <div class="visualizer-content">
@@ -239,180 +319,205 @@
         <!-- Waveform History Representation -->
         <div class="waveform-history-container">
           <div class="waveform-bars">
-            <div 
-              *ngFor="let dbVal of volumeHistory" 
-              class="waveform-bar"
-              [style.height]="formatVolumePercent(dbVal)"
-              [class.active-song]="dbVal > thresholdDb"
-            ></div>
+            @for (dbVal of volumeHistory; track $index) {
+              <div 
+                class="waveform-bar"
+                [style.height]="formatVolumePercent(dbVal)"
+                [class.active-song]="dbVal > thresholdDb"
+              ></div>
+            }
           </div>
-          <div class="waveform-overlay-text" *ngIf="state.status === 'idle'">
-            Visualizer Idle (Awaiting Input Stream)
-          </div>
+          @if (state.status === 'idle') {
+            <div class="waveform-overlay-text">
+              Visualizer Idle (Awaiting Input Stream)
+            </div>
+          }
         </div>
 
         <!-- Progress Metrics -->
-        <div class="progress-details-block" *ngIf="state.status !== 'idle'">
-          <div class="progress-percentage-row">
-            <span>Progress: {{ state.progress }}%</span>
-            <span>{{ formatTime(state.currentTime) }} / {{ formatTime(state.totalDurationEstimate) }}</span>
+        @if (state.status !== 'idle') {
+          <div class="progress-details-block">
+            <div class="progress-percentage-row">
+              <span>Progress: {{ state.progress }}%</span>
+              <span>{{ formatTime(state.currentTime) }} / {{ formatTime(state.totalDurationEstimate) }}</span>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill" [style.width.%]="state.progress"></div>
+            </div>
           </div>
-          <div class="progress-track">
-            <div class="progress-fill" [style.width.%]="state.progress"></div>
-          </div>
-        </div>
+        }
         
-        <div class="visualizer-idle-info" *ngIf="state.status === 'idle'">
-          <div class="graphic-lines">
-            <span></span><span></span><span></span>
+        @if (state.status === 'idle') {
+          <div class="visualizer-idle-info">
+            <div class="graphic-lines">
+              <span></span><span></span><span></span>
+            </div>
+            <p>Stream monitoring will activate dynamically upon slicing start.</p>
           </div>
-          <p>Stream monitoring will activate dynamically upon slicing start.</p>
-        </div>
+        }
       </div>
     </section>
   </main>
 
   <!-- Track Slices Section -->
-  <section class="card-panel glass-panel tracks-section" *ngIf="tracks.length > 0">
-    <div class="section-actions-header">
-      <h2>
-        <i class="fa-solid fa-list-music text-purple"></i> 
-        Identified Song Slices
-        <span class="track-count-badge">{{ tracks.length }} found</span>
-      </h2>
-      
-      <button 
-        class="btn btn-secondary btn-download-all" 
-        (click)="downloadAll()" 
-        *ngIf="tracks.length > 0"
-        title="Download all completed track MP3s sequentially"
-      >
-        <i class="fa-solid fa-circle-down"></i> Download All Slices
-      </button>
-    </div>
-
-    <!-- Tracks Grid -->
-    <div class="tracks-list">
-      <div 
-        class="track-card glass-panel" 
-        *ngFor="let track of tracks"
-        [class.card-encoding]="track.status === 'encoding'"
-        [class.card-done]="track.status === 'done'"
-      >
-        <div class="track-card-header">
-          <span class="track-number">#{{ track.id }}</span>
-          
-          <!-- Title / Title Editor -->
-          <div class="track-title-container">
-            <div *ngIf="editingTrackId !== track.id" class="title-display">
-              <span class="track-title-text">{{ track.title }}</span>
-              <button class="edit-title-btn" (click)="startEditing(track)" title="Rename Track">
-                <i class="fa-solid fa-pen-to-square"></i>
-              </button>
-            </div>
-            
-            <div *ngIf="editingTrackId === track.id" class="title-input-wrapper">
-              <input 
-                type="text" 
-                [(ngModel)]="editingTitle" 
-                (keyup.enter)="saveEditing(track.id)"
-                (keyup.escape)="cancelEditing()"
-                class="title-edit-input"
-                focus
-              />
-              <button class="save-title-btn" (click)="saveEditing(track.id)"><i class="fa-solid fa-check"></i></button>
-              <button class="cancel-title-btn" (click)="cancelEditing()"><i class="fa-solid fa-xmark"></i></button>
-            </div>
-          </div>
-
-          <!-- Status badge -->
-          <div class="track-status-badge" [ngClass]="getStatusClass(track.status)">
-            <i class="fa-solid" [ngClass]="getStatusIcon(track.status)"></i>
-            <span>{{ track.status | uppercase }}</span>
-          </div>
-        </div>
-
-        <div class="track-card-body">
-          <div class="track-meta-grid">
-            <div class="meta-item">
-              <span class="meta-label">Duration:</span>
-              <span class="meta-value text-cyan">{{ formatTime(track.duration) }}</span>
-            </div>
-            <div class="meta-item">
-              <span class="meta-label">Interval:</span>
-              <span class="meta-value">{{ formatTime(track.startTime) }} - {{ formatTime(track.endTime) }}</span>
-            </div>
-          </div>
-
-          <!-- Speech Transcript Preview -->
-          <div class="track-transcript-bubble" *ngIf="track.transcription">
-            <div class="bubble-title"><i class="fa-solid fa-quote-left text-purple"></i> Spoken Intro (Transcribed)</div>
-            <p class="bubble-text">"{{ track.transcription }}"</p>
-          </div>
-
-          <div class="track-card-actions">
-            <!-- Audio Preview Player -->
-            <div class="player-wrapper" *ngIf="track.status === 'done'">
-              <audio [src]="track.mp3Url" controls class="html5-player"></audio>
-            </div>
-
-            <!-- Single Download Button -->
-            <button 
-              class="btn btn-secondary btn-icon-only" 
-              [disabled]="track.status !== 'done'"
-              (click)="downloadTrack(track)" 
-              title="Download Track MP3"
-            >
-              <i class="fa-solid fa-download"></i>
-            </button>
-          </div>
-        </div>
+  @if (tracks.length > 0) {
+    <section class="card-panel glass-panel tracks-section">
+      <div class="section-actions-header">
+        <h2>
+          <i class="fa-solid fa-list-music text-purple"></i> 
+          Identified Song Slices
+          <span class="track-count-badge">{{ tracks.length }} found</span>
+        </h2>
+        
+        <button 
+          class="btn btn-secondary btn-download-all" 
+          (click)="downloadAll()"
+          title="Download all completed track MP3s sequentially"
+        >
+          <i class="fa-solid fa-circle-down"></i> Download All Slices
+        </button>
       </div>
-    </div>
-  </section>
+
+      <!-- Tracks Grid -->
+      <div class="tracks-list">
+        @for (track of tracks; track track.id) {
+          <div 
+            class="track-card glass-panel"
+            [class.card-encoding]="track.status === 'encoding'"
+            [class.card-done]="track.status === 'done'"
+          >
+            <div class="track-card-header">
+              <span class="track-number">#{{ track.id }}</span>
+              
+              <!-- Title / Title Editor -->
+              <div class="track-title-container">
+                @if (editingTrackId !== track.id) {
+                  <div class="title-display">
+                    <span class="track-title-text">{{ track.title }}</span>
+                    <button class="edit-title-btn" (click)="startEditing(track)" title="Rename Track">
+                      <i class="fa-solid fa-pen-to-square"></i>
+                    </button>
+                  </div>
+                } @else {
+                  <div class="title-input-wrapper">
+                    <input 
+                      type="text" 
+                      [(ngModel)]="editingTitle" 
+                      (keyup.enter)="saveEditing(track.id)"
+                      (keyup.escape)="cancelEditing()"
+                      class="title-edit-input"
+                      focus
+                    />
+                    <button class="save-title-btn" (click)="saveEditing(track.id)"><i class="fa-solid fa-check"></i></button>
+                    <button class="cancel-title-btn" (click)="cancelEditing()"><i class="fa-solid fa-xmark"></i></button>
+                  </div>
+                }
+              </div>
+
+              <!-- Status badge -->
+              <div class="track-status-badge" [ngClass]="getStatusClass(track.status)">
+                <i class="fa-solid" [ngClass]="getStatusIcon(track.status)"></i>
+                <span>{{ track.status | uppercase }}</span>
+              </div>
+            </div>
+
+            <div class="track-card-body">
+              <div class="track-meta-grid">
+                <div class="meta-item">
+                  <span class="meta-label">Duration:</span>
+                  <span class="meta-value text-cyan">{{ formatTime(track.duration) }}</span>
+                </div>
+                <div class="meta-item">
+                  <span class="meta-label">Interval:</span>
+                  <span class="meta-value">{{ formatTime(track.startTime) }} - {{ formatTime(track.endTime) }}</span>
+                </div>
+              </div>
+
+              <!-- Speech Transcript Preview -->
+              @if (track.transcription) {
+                <div class="track-transcript-bubble">
+                  <div class="bubble-title"><i class="fa-solid fa-quote-left text-purple"></i> Spoken Intro (Transcribed)</div>
+                  <p class="bubble-text">"{{ track.transcription }}"</p>
+                </div>
+              }
+
+              <div class="track-card-actions">
+                <!-- Audio Preview Player -->
+                @if (track.status === 'done') {
+                  <div class="player-wrapper">
+                    <audio [src]="track.mp3Url" controls class="html5-player"></audio>
+                  </div>
+                }
+
+                <!-- Single Download Button -->
+                <button 
+                  class="btn btn-secondary btn-icon-only" 
+                  [disabled]="track.status !== 'done'"
+                  (click)="downloadTrack(track)" 
+                  title="Download Track MP3"
+                >
+                  <i class="fa-solid fa-download"></i>
+                </button>
+              </div>
+            </div>
+          </div>
+        }
+      </div>
+    </section>
+  }
 
   <!-- Speech Segments / Transcription Log -->
-  <section class="card-panel glass-panel segments-section" *ngIf="segments.length > 0">
-    <div class="expandable-header">
-      <h2><i class="fa-solid fa-file-waveform text-accent"></i> Speech Segment & AI Transcription Log</h2>
-      <p class="section-desc">Quiet gaps are transcribed first, then their text is used to name the following MP3 slice.</p>
-    </div>
+  @if (segments.length > 0) {
+    <section class="card-panel glass-panel segments-section">
+      <div class="expandable-header">
+        <h2><i class="fa-solid fa-file-waveform text-accent"></i> Speech Segment & AI Transcription Log</h2>
+        <p class="section-desc">Quiet gaps are transcribed first, then their text is used to name the following MP3 slice.</p>
+      </div>
 
-    <div class="segments-table-wrapper">
-      <table class="segments-table">
-        <thead>
-          <tr>
-            <th>Segment</th>
-            <th>Duration</th>
-            <th>Silence Range</th>
-            <th>Status</th>
-            <th>Raw Speech Text</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr *ngFor="let seg of segments">
-            <td><strong class="text-accent">GAP #{{ seg.id }}</strong></td>
-            <td>{{ formatTime(seg.duration) }}</td>
-            <td class="text-muted">{{ formatTime(seg.startTime) }} - {{ formatTime(seg.endTime) }}</td>
-            <td>
-              <span 
-                class="seg-status-tag"
-                [class.tag-transcribing]="seg.status === 'transcribing'"
-                [class.tag-done]="seg.status === 'done'"
-                [class.tag-failed]="seg.status === 'failed'"
-              >
-                <i class="fa-solid" [ngClass]="seg.status === 'transcribing' ? 'fa-spinner fa-spin' : (seg.status === 'done' ? 'fa-check' : 'fa-triangle-exclamation')"></i>
-                {{ seg.status }}
-              </span>
-            </td>
-            <td class="transcript-cell">
-              <span *ngIf="seg.status === 'transcribing'" class="text-dark-italic">AI is transcribing the quiet gap...</span>
-              <span *ngIf="seg.status === 'done'" class="text-transcript">"{{ seg.text }}"</span>
-              <span *ngIf="seg.status === 'failed'" class="text-danger">{{ seg.text || 'Failed to transcribe speech' }}</span>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  </section>
+      <div class="segments-table-wrapper">
+        <table class="segments-table">
+          <thead>
+            <tr>
+              <th>Segment</th>
+              <th>Duration</th>
+              <th>Silence Range</th>
+              <th>Status</th>
+              <th>Raw Speech Text</th>
+            </tr>
+          </thead>
+          <tbody>
+            @for (seg of segments; track seg.id) {
+              <tr>
+                <td><strong class="text-accent">GAP #{{ seg.id }}</strong></td>
+                <td>{{ formatTime(seg.duration) }}</td>
+                <td class="text-muted">{{ formatTime(seg.startTime) }} - {{ formatTime(seg.endTime) }}</td>
+                <td>
+                  <span 
+                    class="seg-status-tag"
+                    [class.tag-transcribing]="seg.status === 'transcribing'"
+                    [class.tag-done]="seg.status === 'done' || seg.status === 'skipped'"
+                    [class.tag-failed]="seg.status === 'failed'"
+                  >
+                    <i class="fa-solid" [ngClass]="seg.status === 'transcribing' ? 'fa-spinner fa-spin' : (seg.status === 'done' ? 'fa-check' : (seg.status === 'skipped' ? 'fa-minus' : 'fa-triangle-exclamation'))"></i>
+                    {{ seg.status }}
+                  </span>
+                </td>
+                <td class="transcript-cell">
+                  @if (seg.status === 'transcribing') {
+                    <span class="text-dark-italic">AI is transcribing the quiet gap...</span>
+                  } @else if (seg.status === 'done') {
+                    <span class="text-transcript">"{{ seg.text }}"</span>
+                  } @else if (seg.status === 'skipped') {
+                    <span class="text-muted">{{ seg.text || 'Transcription skipped because no provider is configured.' }}</span>
+                  } @else if (seg.status === 'failed') {
+                    <span class="text-danger">{{ seg.text || 'Failed to transcribe speech' }}</span>
+                  }
+                </td>
+              </tr>
+            }
+          </tbody>
+        </table>
+      </div>
+    </section>
+  }
 </div>

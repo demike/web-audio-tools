@@ -82,8 +82,6 @@ export class WavStreamParser {
   private bytesProcessed = 0;
   private dataBytesRead = 0;
 
-  constructor() {}
-
   /**
    * Processes a new Uint8Array chunk from the stream.
    * Returns an array of Float32Array (one per channel) containing the newly decoded samples.
@@ -94,7 +92,6 @@ export class WavStreamParser {
     combined.set(this.leftoverBytes);
     combined.set(chunk, this.leftoverBytes.length);
 
-    let view = new DataView(combined.buffer, combined.byteOffset, combined.length);
     let offset = 0;
 
     // 1. Parse header if not yet parsed
@@ -124,8 +121,13 @@ export class WavStreamParser {
       offset = 0;
     }
 
+    const header = this.header;
+    if (!header) {
+      return null;
+    }
+
     const bytesLeft = combined.length - offset;
-    const bytesPerSample = (this.header!.bitsPerSample / 8) * this.header!.channels;
+    const bytesPerSample = (header.bitsPerSample / 8) * header.channels;
     
     if (bytesLeft < bytesPerSample) {
       this.leftoverBytes = combined.subarray(offset);
@@ -143,7 +145,7 @@ export class WavStreamParser {
     this.dataBytesRead += bytesToRead;
 
     // Decode PCM to Float32 channel buffers
-    return this.decodePCM(activeSlice, this.header!);
+    return this.decodePCM(activeSlice, header);
   }
 
   /**

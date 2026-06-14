@@ -6,6 +6,9 @@ export default [
   ...nx.configs['flat/angular-template'],
   ...baseConfig,
   {
+    ignores: ['**/public/lame.min.js'],
+  },
+  {
     files: ['**/*.ts'],
     rules: {
       '@angular-eslint/directive-selector': [

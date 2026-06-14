@@ -1,18 +1,45 @@
-import { Injectable } from '@angular/core';
-import { AudioSlicerService } from './audio-slicer.service';
+import { Injectable, inject } from '@angular/core';
+import { AudioSlicerService, SlicerState } from './audio-slicer.service';
+
+type WebMcpToolResponse = {
+  content: Array<{
+    type: 'text';
+    text: string;
+  }>;
+};
+
+type WebMcpToolDefinition<Params = Record<string, unknown>> = {
+  name: string;
+  description: string;
+  inputSchema: {
+    type: 'object';
+    properties: Record<string, unknown>;
+    required?: string[];
+  };
+  execute: (params: Params) => Promise<WebMcpToolResponse>;
+};
+
+type WebMcpContext = {
+  registerTool: <Params = Record<string, unknown>>(tool: WebMcpToolDefinition<Params>) => void;
+};
+
+type ModelContextCapable = {
+  modelContext?: WebMcpContext;
+};
 
 @Injectable({
   providedIn: 'root'
 })
 export class WebMcpService {
-  constructor(private audioSlicerService: AudioSlicerService) {}
+  private readonly audioSlicerService = inject(AudioSlicerService);
 
   /**
    * Initializes WebMCP tool registrations.
    * Checks both navigator.modelContext and document.modelContext.
    */
   public registerWebMcpTools(): void {
-    const modelContext = (navigator as any).modelContext || (document as any).modelContext;
+    const modelContext = (navigator as Navigator & ModelContextCapable).modelContext
+      || (document as Document & ModelContextCapable).modelContext;
 
     if (!modelContext || typeof modelContext.registerTool !== 'function') {
       console.log('WebMCP Model Context API is not supported in this browser. Skipping tool registration.');
@@ -29,8 +56,8 @@ export class WebMcpService {
         type: 'object',
         properties: {}
       },
-      execute: async () => {
-        let stateVal: any = null;
+      execute: async (): Promise<WebMcpToolResponse> => {
+        let stateVal: SlicerState | null = null;
         this.audioSlicerService.state$.subscribe(s => stateVal = s).unsubscribe();
         return {
           content: [
@@ -51,7 +78,7 @@ export class WebMcpService {
         type: 'object',
         properties: {}
       },
-      execute: async () => {
+      execute: async (): Promise<WebMcpToolResponse> => {
         const tracks = this.audioSlicerService.getTracksValue();
         const formattedTracks = tracks.map(t => ({
           id: t.id,
@@ -92,7 +119,7 @@ export class WebMcpService {
         },
         required: ['trackId', 'title']
       },
-      execute: async (params: { trackId: number; title: string }) => {
+      execute: async (params: { trackId: number; title: string }): Promise<WebMcpToolResponse> => {
         const { trackId, title } = params;
         this.audioSlicerService.updateTrackTitle(trackId, title);
         
@@ -115,7 +142,7 @@ export class WebMcpService {
         type: 'object',
         properties: {}
       },
-      execute: async () => {
+      execute: async (): Promise<WebMcpToolResponse> => {
         const segments = this.audioSlicerService.getSegmentsValue();
         const formattedSegments = segments.map(s => ({
           id: s.id,

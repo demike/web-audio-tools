@@ -380,7 +380,7 @@
 
       <!-- Tracks Grid -->
       <div class="tracks-list">
-        @for (track of tracks; track track.id) {
+        @for (track of tracks; track track.key) {
           <div 
             class="track-card glass-panel"
             [class.card-encoding]="track.status === 'encoding'"

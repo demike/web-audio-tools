@@ -1,45 +1,23 @@
 import { Injectable, inject } from '@angular/core';
 import { BehaviorSubject, Subject } from 'rxjs';
-import { WavStreamParser, calculateRms, rmsToDb, createWavBlob, prepareSpeechAudio } from './audio-helper';
+import {
+  Slicer,
+  bytesToBlob,
+  type AudioInput,
+  type SilenceSegment,
+  type SliceOptions,
+  type SlicerState,
+  type Track as CoreTrack
+} from '@web-audio-tools/audio-core';
+import { WorkerMp3Encoder, browserScheduler } from './browser-encoders';
 import { TranscriptionService } from './transcription.service';
 
-export interface Track {
-  key: number;
-  id: number;
-  title: string;
-  titleSource: 'default' | 'transcription' | 'metadata' | 'manual';
-  startTime: number;
-  endTime: number;
-  duration: number;
+export type { SilenceSegment, SlicerState, SliceOptions };
+
+/** Browser track adds object-URL playback fields on top of the core track. */
+export interface Track extends CoreTrack {
   mp3Blob: Blob | null;
   mp3Url: string | null;
-  transcription: string | null;
-  status: 'pending' | 'encoding' | 'done' | 'failed';
-}
-
-export interface SilenceSegment {
-  id: number;
-  startTime: number;
-  endTime: number;
-  duration: number;
-  text: string | null;
-  status: 'idle' | 'transcribing' | 'done' | 'skipped' | 'failed';
-}
-
-export interface SlicerState {
-  status: 'idle' | 'slicing' | 'done';
-  fileName: string;
-  progress: number;
-  currentTime: number;
-  totalDurationEstimate: number;
-  dbLevel: number;
-  currentTrackId: number | null;
-  currentStateName: 'SILENCE' | 'SONG';
-}
-
-export interface SliceOptions {
-  transcribeSpeechGaps?: boolean;
-  trackStartIndex?: number;
 }
 
 @Injectable({
@@ -47,10 +25,12 @@ export interface SliceOptions {
 })
 export class AudioSlicerService {
   // Slicing parameters (user customizable)
-  public thresholdDb = -45; // Volume threshold for silence (dB)
-  public minSilenceDuration = 2.0; // Minimum silence duration to trigger split (s)
-  public minSongDuration = 8.0; // Minimum song duration to save (s)
-  public mp3Bitrate = 192; // MP3 bitrate (kbps)
+  public thresholdDb = -45;
+  public minSilenceDuration = 2.0;
+  public minSongDuration = 8.0;
+  public mp3Bitrate = 192;
+  public preRollSec = 0.3;
+  public postRollSec = 0.5;
 
   private state = new BehaviorSubject<SlicerState>({
     status: 'idle',
@@ -72,12 +52,39 @@ export class AudioSlicerService {
   public segments$ = this.segments.asObservable();
   public volumeLevel$ = this.volumeLevel.asObservable();
 
-  private activeWorker: Worker | null = null;
-  private cancelRequested = false;
-  private workerQueueDepth = 0;
-  private workerCapacityWaiters: Array<() => void> = [];
-  private readonly maxWorkerQueueDepth = 8;
   private readonly transcriptionService = inject(TranscriptionService);
+  private currentFile: File | null = null;
+
+  /** Persistent core slicer; its observer drives the RxJS streams the UI consumes. */
+  private readonly core = new Slicer({
+    encoderFactory: () => new WorkerMp3Encoder(),
+    transcription: null,
+    scheduler: browserScheduler,
+    observer: {
+      onState: state => this.state.next(state),
+      onVolume: db => this.volumeLevel.next(db),
+      onTrackAdded: track => this.tracks.next([...this.tracks.getValue(), this.toBrowserTrack(track)]),
+      onTrackUpdated: track => this.tracks.next(this.tracks.getValue().map(t => t.key === track.key ? this.toBrowserTrack(track) : t)),
+      onTrackRemoved: key => {
+        const removed = this.tracks.getValue().find(t => t.key === key);
+        if (removed?.mp3Url) {
+          URL.revokeObjectURL(removed.mp3Url);
+        }
+        this.tracks.next(this.tracks.getValue().filter(t => t.key !== key));
+      },
+      onSegmentAdded: segment => this.segments.next([...this.segments.getValue(), segment]),
+      onSegmentUpdated: segment => this.segments.next(this.segments.getValue().map(s => s.id === segment.id ? segment : s))
+    }
+  });
+
+  /** Exposed so the WebMCP tool layer can drive the same slicer the UI watches. */
+  public getCoreSlicer(): Slicer {
+    return this.core;
+  }
+
+  public getCurrentFile(): File | null {
+    return this.currentFile;
+  }
 
   public getTracksValue(): Track[] {
     return this.tracks.getValue();
@@ -88,33 +95,27 @@ export class AudioSlicerService {
   }
 
   public updateTrackTitle(trackId: number, title: string, titleSource: Track['titleSource'] = 'manual'): void {
-    const currentTracks = this.tracks.getValue();
-    const updatedTracks = currentTracks.map(t => t.id === trackId ? { ...t, title, titleSource } : t);
-    this.tracks.next(updatedTracks);
+    this.core.updateTrackTitle(trackId, title, titleSource);
   }
 
   public updateTrackTitleByKey(trackKey: number, title: string, titleSource: Track['titleSource'] = 'manual'): void {
-    const currentTracks = this.tracks.getValue();
-    const updatedTracks = currentTracks.map(t => t.key === trackKey ? { ...t, title, titleSource } : t);
-    this.tracks.next(updatedTracks);
+    this.core.updateTrackTitleByKey(trackKey, title, titleSource);
+  }
+
+  /** Removes an unwanted track; the observer revokes its URL and updates the stream. */
+  public removeTrack(trackId: number): void {
+    this.core.removeTrackById(trackId);
   }
 
   public cancelSlicing(): void {
-    this.cancelRequested = true;
+    this.core.cancel();
   }
 
-  /**
-   * Resets the entire slicer state.
-   */
   public reset(): void {
-    this.cancelRequested = false;
+    this.core.cancel();
+    this.revokeAllUrls();
     this.tracks.next([]);
     this.segments.next([]);
-    if (this.activeWorker) {
-      this.activeWorker.terminate();
-      this.activeWorker = null;
-    }
-    this.resetWorkerFlowControl();
     this.state.next({
       status: 'idle',
       fileName: '',
@@ -128,832 +129,57 @@ export class AudioSlicerService {
   }
 
   /**
-   * Main slicing entry point. Streams a WAV file and splits it.
+   * Main slicing entry point. Delegates to the platform-agnostic core Slicer,
+   * wiring browser adapters (Worker encoder, Prompt API/Gemini transcription).
    */
   public async sliceWavFile(file: File, options: SliceOptions = {}): Promise<void> {
     this.reset();
-    this.state.next({
-      ...this.state.getValue(),
-      status: 'slicing',
-      fileName: file.name
+    this.currentFile = file;
+    await this.runInput(file.stream(), {
+      ...options,
+      fileName: file.name,
+      fileSizeBytes: file.size
     });
+  }
 
-    const transcribeSpeechGaps = options.transcribeSpeechGaps ?? true;
-    const trackStartIndex = this.normalizeTrackStartIndex(options.trackStartIndex);
-
-    // Estimate duration: 16-bit stereo 44.1kHz WAV has ~176400 bytes/sec
-    const bytesPerSecond = 44100 * 2 * 2;
-    let estimatedDuration = file.size / bytesPerSecond;
-    let durationEstimateUpdated = false;
-    this.state.next({
-      ...this.state.getValue(),
-      totalDurationEstimate: estimatedDuration
-    });
-
-    const stream = file.stream();
-    const reader = stream.getReader();
-    const parser = new WavStreamParser();
-
-    // Hysteresis State Machine Variables
-    let currentState: 'SILENCE' | 'SONG' = 'SILENCE';
-    let sampleRate = 44100;
-    let numChannels = 2;
-
-    let totalSamplesProcessed = 0;
-    
-    // Song accumulation worker state
-    let trackKeyCounter = 0;
-    let nextTrackIndex = trackStartIndex;
-    let currentSongTrack: Track | null = null;
-    let songStartSec = 0;
-    const getCurrentSongTrack = (): Track | null => currentSongTrack;
-
-    // Silence accumulation state
-    let silenceSegmentCounter = 0;
-    let currentSilenceBuffer: Float32Array[][] = [];
-    let silenceStartSec = 0;
-
-    // Lookahead buffer for potential silence (when in SONG state and volume drops)
-    let pendingSilenceBuffer: Float32Array[][] = [];
-    let silenceTimerSec = 0;
-    let silenceDropStartSec = 0;
-
-    // Short-song capture: in ensemble rehearsals, spoken announcements can be
-    // louder than the silence threshold yet shorter than minSongDuration.
-    // Buffer such regions so they can be transcribed instead of discarded.
-    let shortSongBuffer: Float32Array[][] = [];
-    let shortSongBufferSec = 0;
-    let shortSongBufferComplete = false;
-
-    const captureShortSongWindow = (windowChannels: Float32Array[], windowDuration: number): void => {
-      if (shortSongBufferComplete) {
-        return;
-      }
-
-      shortSongBuffer = this.appendChannelChunks(shortSongBuffer, windowChannels);
-      shortSongBufferSec += windowDuration;
-
-      if (shortSongBufferSec >= this.minSongDuration) {
-        // Long enough to be a real piece; release the buffer to save memory.
-        shortSongBuffer = [];
-        shortSongBufferComplete = true;
-      }
-    };
-
-    // RMS analysis window settings
-    const windowSize = 8192; // ~185ms at 44.1kHz
-    let analysisLeftover: Float32Array[] = [];
-    let lastUiUpdateTick = 0;
-    let pendingUiDb = -100;
-    let pendingUiCurrentTime = 0;
-    let windowsProcessedSinceYield = 0;
-    let lastYieldTick = this.getNow();
-
-    const flushUiUpdate = (force = false): void => {
-      const now = this.getNow();
-      if (!force && now - lastUiUpdateTick < 50) {
-        return;
-      }
-
-      lastUiUpdateTick = now;
-      this.volumeLevel.next(pendingUiDb);
-      this.state.next({
-        ...this.state.getValue(),
-        currentTime: pendingUiCurrentTime,
-        dbLevel: pendingUiDb,
-        progress: Math.min(100, Math.round((pendingUiCurrentTime / estimatedDuration) * 100))
-      });
-    };
-
-    const processWindow = (windowChannels: Float32Array[]): void => {
-      const windowSampleCount = windowChannels[0]?.length ?? 0;
-      if (windowSampleCount === 0) {
-        return;
-      }
-
-      const windowDuration = windowSampleCount / sampleRate;
-      // Analyze the loudest channel so speech panned away from the left is not missed.
-      let rms = 0;
-      for (const channel of windowChannels) {
-        rms = Math.max(rms, calculateRms(channel));
-      }
-      const db = rmsToDb(rms);
-      const currentTime = totalSamplesProcessed / sampleRate;
-      const progressTime = (totalSamplesProcessed + windowSampleCount) / sampleRate;
-
-      pendingUiDb = db;
-      pendingUiCurrentTime = progressTime;
-      flushUiUpdate();
-
-      totalSamplesProcessed += windowSampleCount;
-
-      if (currentState === 'SILENCE') {
-        if (db > this.thresholdDb) {
-          currentState = 'SONG';
-          this.state.next({
-            ...this.state.getValue(),
-            currentStateName: 'SONG'
-          });
-
-          if (this.hasChannelChunks(currentSilenceBuffer)) {
-            const silenceEndSec = currentTime;
-            const silenceDuration = silenceEndSec - silenceStartSec;
-
-            if (silenceDuration > 0.5) {
-              silenceSegmentCounter++;
-              const segmentId = silenceSegmentCounter;
-              const segment: SilenceSegment = {
-                id: segmentId,
-                startTime: silenceStartSec,
-                endTime: silenceEndSec,
-                duration: silenceDuration,
-                text: null,
-                status: 'transcribing'
-              };
-
-              this.registerSilenceSegment(
-                segment,
-                this.mergeChannelChunks(currentSilenceBuffer),
-                sampleRate,
-                trackKeyCounter + 1,
-                transcribeSpeechGaps
-              );
-            }
-          }
-
-          currentSilenceBuffer = [];
-
-          trackKeyCounter++;
-          songStartSec = currentTime;
-          currentSongTrack = {
-            key: trackKeyCounter,
-            id: nextTrackIndex,
-            title: `Track ${nextTrackIndex}`,
-            titleSource: 'default',
-            startTime: songStartSec,
-            endTime: 0,
-            duration: 0,
-            mp3Blob: null,
-            mp3Url: null,
-            transcription: null,
-            status: 'encoding'
-          };
-
-          const newTrack = currentSongTrack;
-          const current = this.tracks.getValue();
-          this.tracks.next([...current, newTrack]);
-          this.state.next({
-            ...this.state.getValue(),
-            currentTrackId: newTrack.id
-          });
-
-          this.initMp3Worker(this.getMp3ExportChannelCount(numChannels), sampleRate, newTrack.key);
-          this.feedSamplesToWorker(windowChannels);
-
-          shortSongBuffer = this.createChannelChunkBuffers(numChannels);
-          shortSongBufferSec = 0;
-          shortSongBufferComplete = false;
-          captureShortSongWindow(windowChannels, windowDuration);
-        } else {
-          if (currentSilenceBuffer.length === 0) {
-            silenceStartSec = currentTime;
-            currentSilenceBuffer = this.createChannelChunkBuffers(numChannels);
-          }
-          currentSilenceBuffer = this.appendChannelChunks(currentSilenceBuffer, windowChannels);
-        }
-      } else if (currentState === 'SONG') {
-        if (db < this.thresholdDb) {
-          if (silenceTimerSec === 0) {
-            silenceDropStartSec = currentTime;
-            pendingSilenceBuffer = this.createChannelChunkBuffers(numChannels);
-          }
-
-          pendingSilenceBuffer = this.appendChannelChunks(pendingSilenceBuffer, windowChannels);
-          captureShortSongWindow(windowChannels, windowDuration);
-          silenceTimerSec += windowDuration;
-
-          if (silenceTimerSec >= this.minSilenceDuration) {
-            currentState = 'SILENCE';
-            this.state.next({
-              ...this.state.getValue(),
-              currentStateName: 'SILENCE',
-              currentTrackId: null
-            });
-
-            const songEndSec = silenceDropStartSec;
-            const songDuration = songEndSec - songStartSec;
-
-            if (songDuration >= this.minSongDuration && currentSongTrack) {
-              currentSongTrack.endTime = songEndSec;
-              currentSongTrack.duration = songDuration;
-              nextTrackIndex++;
-              this.finishMp3Worker();
-            } else if (currentSongTrack) {
-              // Short regions are usually spoken announcements, count-offs, or
-              // tuning. Transcribe them for the next track instead of dropping
-              // the audio on the floor.
-              if (!shortSongBufferComplete && songDuration > 0.5 && this.hasChannelChunks(shortSongBuffer)) {
-                silenceSegmentCounter++;
-                const segment: SilenceSegment = {
-                  id: silenceSegmentCounter,
-                  startTime: songStartSec,
-                  endTime: songEndSec,
-                  duration: songDuration,
-                  text: null,
-                  status: 'transcribing'
-                };
-
-                this.registerSilenceSegment(
-                  segment,
-                  this.mergeChannelChunks(shortSongBuffer),
-                  sampleRate,
-                  trackKeyCounter + 1,
-                  transcribeSpeechGaps
-                );
-              }
-              this.discardCurrentTrack(currentSongTrack.key);
-            }
-
-            shortSongBuffer = [];
-            shortSongBufferSec = 0;
-            shortSongBufferComplete = false;
-            currentSongTrack = null;
-
-            silenceStartSec = silenceDropStartSec;
-            currentSilenceBuffer = pendingSilenceBuffer;
-            pendingSilenceBuffer = [];
-            silenceTimerSec = 0;
-          }
-        } else {
-          if (silenceTimerSec > 0) {
-            this.feedSamplesToWorker(this.mergeChannelChunks(pendingSilenceBuffer));
-            pendingSilenceBuffer = [];
-            silenceTimerSec = 0;
-          }
-
-          this.feedSamplesToWorker(windowChannels);
-          captureShortSongWindow(windowChannels, windowDuration);
-        }
-      }
+  /** Runs the core slicer over an arbitrary input (used by the UI and tools). */
+  public async runInput(input: AudioInput, options: SliceOptions = {}): Promise<void> {
+    this.core.transcription = options.externalTranscription ? null : this.transcriptionService;
+    this.core.parameters = {
+      thresholdDb: this.thresholdDb,
+      minSilenceDuration: this.minSilenceDuration,
+      minSongDuration: this.minSongDuration,
+      mp3Bitrate: this.mp3Bitrate,
+      preRollSec: this.preRollSec,
+      postRollSec: this.postRollSec
     };
 
     try {
-      while (true) {
-        if (this.cancelRequested) {
-          reader.releaseLock();
-          break;
-        }
-
-        const { done, value } = await reader.read();
-        
-        // Feed chunk to parser
-        let parsedChannels: Float32Array[] | null = null;
-        if (value) {
-          parsedChannels = parser.feed(value);
-        } else if (done) {
-          parsedChannels = parser.flush();
-        }
-
-        if (parser.header) {
-          sampleRate = parser.header.sampleRate;
-          numChannels = parser.header.channels;
-
-          if (!durationEstimateUpdated) {
-            const headerBytesPerSecond = parser.header.sampleRate * parser.header.channels * (parser.header.bitsPerSample / 8);
-            if (headerBytesPerSecond > 0) {
-              estimatedDuration = file.size / headerBytesPerSecond;
-              durationEstimateUpdated = true;
-              this.state.next({
-                ...this.state.getValue(),
-                totalDurationEstimate: estimatedDuration
-              });
-            }
-          }
-        }
-
-        if (parsedChannels && parsedChannels.length > 0) {
-          // 1. Accumulate parsed samples for analysis window alignment
-          const alignedChannels = this.alignBufferWindows(analysisLeftover, parsedChannels, windowSize);
-          analysisLeftover = alignedChannels.leftover;
-          const samplesToAnalyze = alignedChannels.ready;
-
-          if (samplesToAnalyze.length > 0 && samplesToAnalyze[0].length > 0) {
-            const numWindows = Math.floor(samplesToAnalyze[0].length / windowSize);
-
-            for (let w = 0; w < numWindows; w++) {
-              await this.waitForWorkerCapacity();
-
-              const startIdx = w * windowSize;
-              const endIdx = startIdx + windowSize;
-
-              // Extract sample window for each channel
-              const windowChannels: Float32Array[] = [];
-              for (let c = 0; c < numChannels; c++) {
-                windowChannels.push(samplesToAnalyze[c].subarray(startIdx, endIdx));
-              }
-
-              processWindow(windowChannels);
-              windowsProcessedSinceYield++;
-
-              if (windowsProcessedSinceYield >= 8 || this.getNow() - lastYieldTick >= 8) {
-                flushUiUpdate(true);
-                await this.yieldToMainThread();
-                lastYieldTick = this.getNow();
-                windowsProcessedSinceYield = 0;
-              }
-            }
-          }
-        }
-
-        if (done) {
-          break;
-        }
-      }
-
-      if (analysisLeftover.length > 0 && analysisLeftover[0].length > 0) {
-        await this.waitForWorkerCapacity();
-        processWindow(analysisLeftover);
-        analysisLeftover = [];
-      }
-
-      flushUiUpdate(true);
-
-      // --- Handle End of Stream ---
-      const currentTime = totalSamplesProcessed / sampleRate;
-      const openSongTrack = getCurrentSongTrack();
-
-      if (openSongTrack) {
-        // Feed any pending silence lookahead buffer (since stream ended, we include it all)
-        if (silenceTimerSec > 0 && this.hasChannelChunks(pendingSilenceBuffer)) {
-          await this.waitForWorkerCapacity();
-          this.feedSamplesToWorker(this.mergeChannelChunks(pendingSilenceBuffer));
-        }
-        
-        openSongTrack.endTime = currentTime;
-        openSongTrack.duration = currentTime - songStartSec;
-        nextTrackIndex++;
-        this.finishMp3Worker();
-      } else if (currentState === 'SILENCE' && this.hasChannelChunks(currentSilenceBuffer)) {
-        // Transcribe final silence segment
-        const silenceDuration = currentTime - silenceStartSec;
-        if (silenceDuration > 0.5) {
-          silenceSegmentCounter++;
-          const segment: SilenceSegment = {
-            id: silenceSegmentCounter,
-            startTime: silenceStartSec,
-            endTime: currentTime,
-            duration: silenceDuration,
-            text: null,
-            status: 'transcribing'
-          };
-
-          this.registerSilenceSegment(
-            segment,
-            this.mergeChannelChunks(currentSilenceBuffer),
-            sampleRate,
-            trackKeyCounter + 1,
-            transcribeSpeechGaps
-          );
-        }
-      }
-
+      await this.core.run(input, options);
     } catch (error) {
       console.error('Error during slicing:', error);
-      this.state.next({
-        ...this.state.getValue(),
-        status: 'idle'
-      });
       throw error;
-    } finally {
-      this.state.next({
-        ...this.state.getValue(),
-        status: 'done',
-        dbLevel: -100
-      });
     }
   }
 
-  /**
-   * Helper to align sample buffers with analysis windows.
-   */
-  private alignBufferWindows(leftover: Float32Array[], incoming: Float32Array[], windowSize: number): { ready: Float32Array[], leftover: Float32Array[] } {
-    const combinedChannels = incoming.map((channel, index) => {
-      const existingLeftover = leftover[index];
-      if (!existingLeftover || existingLeftover.length === 0) {
-        return channel;
-      }
+  private toBrowserTrack(core: CoreTrack): Track {
+    const existing = this.tracks.getValue().find(t => t.key === core.key);
+    let mp3Blob = existing?.mp3Blob ?? null;
+    let mp3Url = existing?.mp3Url ?? null;
 
-      const combined = new Float32Array(existingLeftover.length + channel.length);
-      combined.set(existingLeftover);
-      combined.set(channel, existingLeftover.length);
-      return combined;
-    });
-
-    if (combinedChannels.length === 0 || combinedChannels[0].length === 0) {
-      return { ready: [], leftover: [] };
+    if (core.mp3Bytes && !mp3Blob) {
+      mp3Blob = bytesToBlob(core.mp3Bytes, 'audio/mp3');
+      mp3Url = URL.createObjectURL(mp3Blob);
     }
 
-    const readyLength = combinedChannels[0].length - (combinedChannels[0].length % windowSize);
-    if (readyLength <= 0) {
-      return {
-        ready: [],
-        leftover: combinedChannels.map(channel => {
-          const copy = new Float32Array(channel.length);
-          copy.set(channel);
-          return copy;
-        })
-      };
-    }
-
-    const newLeftoverLength = combinedChannels[0].length - readyLength;
-    return {
-      ready: combinedChannels.map(channel => channel.subarray(0, readyLength)),
-      leftover: newLeftoverLength > 0
-        ? combinedChannels.map(channel => {
-            const remainder = channel.subarray(readyLength);
-            const copy = new Float32Array(remainder.length);
-            copy.set(remainder);
-            return copy;
-          })
-        : []
-    };
+    return { ...core, mp3Blob, mp3Url };
   }
 
-  private appendChannelBuffers(dest: Float32Array[], source: Float32Array[]): Float32Array[] {
-    const result: Float32Array[] = [];
-    for (let c = 0; c < dest.length; c++) {
-      const merged = new Float32Array(dest[c].length + source[c].length);
-      merged.set(dest[c]);
-      merged.set(source[c], dest[c].length);
-      result.push(merged);
-    }
-    return result;
-  }
-
-  private createChannelChunkBuffers(channelCount: number): Float32Array[][] {
-    return Array.from({ length: channelCount }, () => [] as Float32Array[]);
-  }
-
-  private appendChannelChunks(dest: Float32Array[][], source: Float32Array[]): Float32Array[][] {
-    const target = dest.length > 0 ? dest : this.createChannelChunkBuffers(source.length);
-
-    for (let c = 0; c < source.length; c++) {
-      const copy = new Float32Array(source[c].length);
-      copy.set(source[c]);
-      target[c].push(copy);
-    }
-
-    return target;
-  }
-
-  private hasChannelChunks(chunks: Float32Array[][]): boolean {
-    return chunks.length > 0 && chunks[0].length > 0;
-  }
-
-  private mergeChannelChunks(chunks: Float32Array[][]): Float32Array[] {
-    return chunks.map(channelChunks => {
-      const totalLength = channelChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-      const merged = new Float32Array(totalLength);
-      let offset = 0;
-
-      for (const chunk of channelChunks) {
-        merged.set(chunk, offset);
-        offset += chunk.length;
-      }
-
-      return merged;
-    });
-  }
-
-  private getNow(): number {
-    return typeof performance !== 'undefined' ? performance.now() : Date.now();
-  }
-
-  private yieldToMainThread(): Promise<void> {
-    return new Promise(resolve => {
-      if (typeof requestAnimationFrame === 'function') {
-        requestAnimationFrame(() => resolve());
-        return;
-      }
-
-      setTimeout(resolve, 0);
-    });
-  }
-
-  // --- Worker Management ---
-  private initMp3Worker(channels: number, sampleRate: number, trackKey: number): void {
-    if (this.activeWorker) {
-      this.activeWorker.terminate();
-    }
-    this.resetWorkerFlowControl();
-
-    const worker = new Worker('/mp3-encoder-worker.js');
-
-    this.activeWorker = worker;
-
-    worker.onmessage = ({ data }) => {
-      const { event, blob, error } = data;
-
-      if (event === 'progress') {
-        this.workerQueueDepth = Math.max(0, this.workerQueueDepth - 1);
-        this.notifyWorkerCapacityAvailable();
-        return;
-      }
-
-      if (event === 'initialized') {
-        return;
-      }
-
-      if (event === 'finished') {
-        this.resetWorkerFlowControl();
-      }
-
-      if (event === 'finished' && blob) {
-        const currentTracks = this.tracks.getValue();
-        const updatedTracks = currentTracks.map(t => {
-          if (t.key === trackKey) {
-            return {
-              ...t,
-              mp3Blob: blob,
-              mp3Url: URL.createObjectURL(blob),
-              status: 'done' as const
-            };
-          }
-          return t;
-        });
-        this.tracks.next(updatedTracks);
-      } else if (event === 'error') {
-        this.resetWorkerFlowControl();
-        console.error('MP3 Encoder Worker Error:', error);
-        if (this.activeWorker === worker) {
-          worker.terminate();
-          this.activeWorker = null;
-        }
-        const currentTracks = this.tracks.getValue();
-        const updatedTracks = currentTracks.map(t => 
-          t.key === trackKey ? { ...t, status: 'failed' as const } : t
-        );
-        this.tracks.next(updatedTracks);
-      }
-    };
-
-    worker.onerror = (event) => {
-      this.resetWorkerFlowControl();
-      if (this.activeWorker === worker) {
-        worker.terminate();
-        this.activeWorker = null;
-      }
-      console.error('MP3 Encoder Worker Uncaught Error:', event.message);
-      const currentTracks = this.tracks.getValue();
-      const updatedTracks = currentTracks.map(t =>
-        t.key === trackKey ? { ...t, status: 'failed' as const } : t
-      );
-      this.tracks.next(updatedTracks);
-    };
-
-    worker.onmessageerror = () => {
-      this.resetWorkerFlowControl();
-      if (this.activeWorker === worker) {
-        worker.terminate();
-        this.activeWorker = null;
-      }
-      console.error('MP3 Encoder Worker Message Error');
-      const currentTracks = this.tracks.getValue();
-      const updatedTracks = currentTracks.map(t =>
-        t.key === trackKey ? { ...t, status: 'failed' as const } : t
-      );
-      this.tracks.next(updatedTracks);
-    };
-
-    worker.postMessage({
-      command: 'init',
-      payload: {
-        channels,
-        sampleRate,
-        bitrate: this.mp3Bitrate
-      }
-    });
-  }
-
-  private feedSamplesToWorker(channelsData: Float32Array[]): void {
-    if (this.activeWorker) {
-      const normalizedChannels = this.normalizeChannelsForMp3(channelsData);
-      const workerChannels = normalizedChannels.map(channel => {
-        const copy = new Float32Array(channel.length);
-        copy.set(channel);
-        return copy;
-      });
-
-      this.workerQueueDepth += 1;
-
-      try {
-        this.activeWorker.postMessage(
-          {
-            command: 'encode',
-            payload: {
-              channelsData: workerChannels
-            }
-          },
-          workerChannels.map(channel => channel.buffer)
-        );
-      } catch (error) {
-        this.workerQueueDepth = Math.max(0, this.workerQueueDepth - 1);
-        this.notifyWorkerCapacityAvailable();
-        throw error;
+  private revokeAllUrls(): void {
+    for (const track of this.tracks.getValue()) {
+      if (track.mp3Url) {
+        URL.revokeObjectURL(track.mp3Url);
       }
     }
-  }
-
-  private finishMp3Worker(): void {
-    if (this.activeWorker) {
-      this.activeWorker.postMessage({ command: 'finish' });
-      this.activeWorker = null; // Let the onmessage handler finish and terminate it
-    }
-  }
-
-  private discardCurrentTrack(trackKey: number): void {
-    if (this.activeWorker) {
-      this.activeWorker.terminate();
-      this.activeWorker = null;
-    }
-    this.resetWorkerFlowControl();
-    const currentTracks = this.tracks.getValue();
-    const filteredTracks = currentTracks.filter(t => t.key !== trackKey);
-    this.tracks.next(filteredTracks);
-  }
-
-  private async waitForWorkerCapacity(): Promise<void> {
-    while (
-      !this.cancelRequested &&
-      this.activeWorker &&
-      this.workerQueueDepth >= this.maxWorkerQueueDepth
-    ) {
-      await new Promise<void>(resolve => {
-        this.workerCapacityWaiters.push(resolve);
-      });
-    }
-  }
-
-  private notifyWorkerCapacityAvailable(): void {
-    if (this.workerQueueDepth >= this.maxWorkerQueueDepth || this.workerCapacityWaiters.length === 0) {
-      return;
-    }
-
-    const waiters = this.workerCapacityWaiters.splice(0);
-    waiters.forEach(resolve => resolve());
-  }
-
-  private resetWorkerFlowControl(): void {
-    this.workerQueueDepth = 0;
-    this.notifyWorkerCapacityAvailable();
-  }
-
-  private getMp3ExportChannelCount(sourceChannels: number): number {
-    if (sourceChannels <= 1) {
-      return 1;
-    }
-
-    return sourceChannels === 2 ? 2 : 1;
-  }
-
-  private normalizeChannelsForMp3(channelsData: Float32Array[]): Float32Array[] {
-    if (channelsData.length <= 2) {
-      return channelsData;
-    }
-
-    const sampleCount = channelsData[0]?.length ?? 0;
-    const mono = new Float32Array(sampleCount);
-
-    for (let channelIndex = 0; channelIndex < channelsData.length; channelIndex++) {
-      const channel = channelsData[channelIndex];
-      for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++) {
-        mono[sampleIndex] += channel[sampleIndex];
-      }
-    }
-
-    for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++) {
-      mono[sampleIndex] /= channelsData.length;
-    }
-
-    return [mono];
-  }
-
-  private registerSilenceSegment(
-    segment: SilenceSegment,
-    pcmBuffer: Float32Array[],
-    sampleRate: number,
-    targetTrackKey: number,
-    transcribeSpeechGaps: boolean
-  ): void {
-    const nextSegment = transcribeSpeechGaps
-      ? segment
-      : {
-          ...segment,
-          status: 'skipped' as const,
-          text: 'Transcription disabled for this analysis run.'
-        };
-
-    const currentSegments = this.segments.getValue();
-    this.segments.next([...currentSegments, nextSegment]);
-
-    if (!transcribeSpeechGaps) {
-      return;
-    }
-
-    this.transcribeSegmentInBackground(nextSegment, pcmBuffer, sampleRate, targetTrackKey);
-  }
-
-  private normalizeTrackStartIndex(value: number | undefined): number {
-    if (!Number.isFinite(value)) {
-      return 1;
-    }
-
-    return Math.max(1, Math.floor(value ?? 1));
-  }
-
-  // --- Transcription and AI Refinement ---
-  private setSegmentStatus(segmentId: number, status: SilenceSegment['status'], text: string | null): void {
-    const currentSegments = this.segments.getValue();
-    const updatedSegments = currentSegments.map(s =>
-      s.id === segmentId ? { ...s, status, text } : s
-    );
-    this.segments.next(updatedSegments);
-  }
-
-  private transcribeSegmentInBackground(
-    segment: SilenceSegment,
-    pcmBuffer: Float32Array[],
-    sampleRate: number,
-    targetTrackKey: number
-  ): void {
-    // Downmix, resample, trim dead air, and normalize before transcription so
-    // the model hears focused, audible speech instead of minutes of faint gap audio.
-    const speechAudio = prepareSpeechAudio(pcmBuffer, sampleRate);
-    if (!speechAudio) {
-      this.setSegmentStatus(segment.id, 'skipped', 'No audible speech detected in this gap.');
-      return;
-    }
-
-    const speechWavBlob = createWavBlob([speechAudio.samples], speechAudio.sampleRate);
-
-    this.transcriptionService.hasTranscriptionProvider()
-      .then(hasProvider => {
-        if (!hasProvider) {
-          this.setSegmentStatus(segment.id, 'skipped', 'Transcription skipped: no Prompt API or Gemini API key is available.');
-          return null;
-        }
-
-        return this.transcriptionService.transcribeAudio(speechWavBlob);
-      })
-      .then(async text => {
-        if (text === null) {
-          const currentSegments = this.segments.getValue();
-          const updatedSegments = currentSegments.map(s =>
-            s.id === segment.id
-              ? {
-                  ...s,
-                  status: 'skipped' as const,
-                  text: 'Transcription skipped: Prompt API could not be used and no Gemini API key is configured.'
-                }
-              : s
-          );
-          this.segments.next(updatedSegments);
-          return;
-        }
-
-        const currentSegments = this.segments.getValue();
-        const updatedSegments = currentSegments.map(s => 
-          s.id === segment.id ? { ...s, text, status: 'done' as const } : s
-        );
-        this.segments.next(updatedSegments);
-
-        const currentTracks = this.tracks.getValue();
-        const updatedTracks = currentTracks.map(t => 
-          t.key === targetTrackKey ? { ...t, transcription: text } : t
-        );
-        this.tracks.next(updatedTracks);
-
-        const extractedTitle = await this.transcriptionService.extractSongTitle(text);
-        if (extractedTitle) {
-          const targetTrack = this.tracks.getValue().find(t => t.key === targetTrackKey);
-          if (targetTrack && targetTrack.titleSource !== 'manual') {
-            this.updateTrackTitleByKey(targetTrackKey, extractedTitle.title, extractedTitle.source);
-          }
-        }
-      })
-      .catch(err => {
-        console.error(`Failed to transcribe segment ${segment.id}:`, err);
-        const currentSegments = this.segments.getValue();
-        const updatedSegments = currentSegments.map(s => 
-          s.id === segment.id
-            ? {
-                ...s,
-                status: 'failed' as const,
-                text: err instanceof Error ? err.message : 'Transcription failed'
-              }
-            : s
-        );
-        this.segments.next(updatedSegments);
-      });
   }
 }

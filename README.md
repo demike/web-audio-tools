@@ -1,38 +1,63 @@
 # Web Audio Tools
 
-This workspace contains a browser-only Angular app that slices large WAV files (e.g. ensemble rehearsal recordings) into MP3 tracks without a Node server.
+Slices large WAV files (e.g. ensemble rehearsal recordings) into MP3 tracks. The
+slicing/transcription logic lives in a platform-agnostic core library shared by a
+browser Angular app, a Node/Bun CLI, and a portable tool layer.
+
+## Layout
+
+- `libs/audio-core` — the shared core: WAV parsing, the SILENCE/SONG state machine,
+  MP3 encoding, speech-gap preparation, transcription clients, and tool definitions.
+  No Angular, DOM, Worker, or Node APIs; platform specifics are injected at seams.
+- `apps/web-audio-slicer` — browser Angular app. Thin adapters over the core: a Web
+  Worker MP3 encoder, File input, localStorage, object URLs, and the Chrome Prompt API.
+- `apps/audio-cli` — Node/Bun CLI. Filesystem input/output, direct lamejs encoding,
+  Gemini transcription, and a JSON manifest.
 
 ## What it does
 
-- Streams WAV input with the File API and parses PCM incrementally instead of loading the whole file into memory.
-- Detects song regions by watching dB level transitions between `SILENCE` and `SONG` windows.
-- Encodes each detected song to MP3 in a Web Worker with `lamejs`.
+- Streams WAV input and parses PCM incrementally instead of loading the whole file into memory.
+- Detects piece regions by watching dB level transitions between `SILENCE` and `SONG` windows.
+- Encodes each detected piece to MP3 (Web Worker in the browser, lamejs directly in Node/Bun).
 - Transcribes spoken announcements (someone naming the piece before it is played) and uses that text to name the next MP3 file.
 - Captures short loud regions too: a spoken announcement above the silence threshold is transcribed instead of being discarded as a too-short track.
 - Prepares gap audio for transcription: mono downmix, 16 kHz resample, silence trimming, long-pause compression, and peak normalization.
-- Exposes track and segment state to compatible browser agents through WebMCP.
+- Exposes the functionality to agents through WebMCP / portable tools, with the calling model doing transcription.
 
 ## AI strategy
 
-- Primary path: Chrome Prompt API for on-device audio transcription and title extraction.
-- Fallback path: Gemini API when the user provides an API key.
-- No mock transcript fallback: if neither provider is available, tracks are still sliced and exported, but silent-gap transcription will fail and titles stay generic.
+- Browser: Chrome Prompt API for on-device transcription, falling back to the Gemini API when a key is provided.
+- Node/Bun: Gemini API only (the Prompt API is Chrome-only). Without a key, tracks are still sliced and encoded, but titles stay generic.
+- Tool layer: the calling model transcribes. `slice_wav` leaves prepared gap audio; the model fetches it (`get_gap_audio`), transcribes it itself, and names tracks with `set_track_title` (optionally canonicalized against MusicBrainz).
+- No mock transcript fallback.
 
-## Why not ffmpeg.wasm
-
-`ffmpeg.wasm` is useful when you need broad codec support or exact FFmpeg parity. This app only needs streamed WAV parsing plus MP3 encoding, so a custom WAV stream parser and a lightweight MP3 worker keep memory use lower and the bundle simpler for a serverless deployment.
-
-## Run it
+## Run the browser app
 
 ```sh
 npx nx serve web-audio-slicer
-```
-
-```sh
 npx nx build web-audio-slicer
 ```
 
 The production bundle is emitted to `dist/apps/web-audio-slicer` and can be hosted as static files.
+
+## Run the CLI (Node or Bun)
+
+```sh
+# Bun runs the TypeScript source directly
+bun apps/audio-cli/src/main.ts rehearsal.wav --out ./tracks
+
+# Or build once and run with Node
+npx nx build audio-cli
+node dist/apps/audio-cli/main.js rehearsal.wav --out ./tracks
+```
+
+Writes each piece as `<title>.mp3` plus a `manifest.json` of tracks, timings, and
+transcriptions. Options: `--threshold`, `--min-silence`, `--min-song`, `--bitrate`,
+`--lang`, `--start-index`, `--no-transcribe`, `--gemini-key` (or `GEMINI_API_KEY`).
+
+## Why not ffmpeg.wasm
+
+`ffmpeg.wasm` is useful when you need broad codec support or exact FFmpeg parity. This app only needs streamed WAV parsing plus MP3 encoding, so a custom WAV stream parser and a lightweight MP3 encoder keep memory use lower and the bundle simpler for a serverless deployment.
 
 ## Browser notes
 

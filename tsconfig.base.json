@@ -13,7 +13,9 @@
     "lib": ["es2020", "dom"],
     "skipLibCheck": true,
     "skipDefaultLibCheck": true,
-    "paths": {}
+    "paths": {
+      "@web-audio-tools/audio-core": ["./libs/audio-core/src/index.ts"]
+    }
   },
   "exclude": ["node_modules", "tmp"]
 }

@@ -24,6 +24,16 @@ export interface SongTitleExtractionResult {
   source: 'metadata' | 'transcription';
 }
 
+interface GeminiGenerateContentResponse {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{
+        text?: string;
+      }>;
+    };
+  }>;
+}
+
 interface MusicBrainzRecordingSearchResponse {
   recordings?: MusicBrainzRecording[];
 }
@@ -193,7 +203,11 @@ export class TranscriptionService {
    */
   public async transcribeAudio(audioBlob: Blob): Promise<string | null> {
     const transcriptionLanguage = this.getTranscriptionLanguage();
-    const promptResult = await this.transcribeWithPromptApi(audioBlob, transcriptionLanguage);
+    // The on-device model only outputs en/es/ja; for other languages go straight
+    // to Gemini instead of getting a wrong-language transcript.
+    const promptResult = this.isPromptApiLanguageSupported(transcriptionLanguage)
+      ? await this.transcribeWithPromptApi(audioBlob, transcriptionLanguage)
+      : null;
     if (promptResult !== null) {
       return promptResult;
     }
@@ -216,7 +230,34 @@ export class TranscriptionService {
       return null;
     }
 
-    const metadataTitle = await this.extractSongTitleWithMusicBrainz(normalizedText);
+    const transcriptionLanguage = this.getTranscriptionLanguage();
+
+    // 1. Ask the LLM for a clean title candidate first. Searching MusicBrainz
+    // with the raw, filler-heavy transcript produced false matches and wasted
+    // rate-limited requests; a clean "Artist - Title" query is far more precise.
+    let candidateTitle: string | null = null;
+
+    if (this.isPromptApiLanguageSupported(transcriptionLanguage)) {
+      candidateTitle = await this.extractSongTitleWithPromptApi(normalizedText, transcriptionLanguage);
+    }
+
+    if (!candidateTitle) {
+      const apiKey = this.getApiKey().trim();
+      if (apiKey) {
+        candidateTitle = await this.extractSongTitleWithGemini(normalizedText, apiKey, transcriptionLanguage);
+      }
+    }
+
+    if (!candidateTitle) {
+      candidateTitle = this.normalizeTitle(this.fallbackRegexExtraction(normalizedText));
+    }
+
+    if (!candidateTitle) {
+      return null;
+    }
+
+    // 2. Verify/canonicalize the candidate against MusicBrainz metadata.
+    const metadataTitle = await this.extractSongTitleWithMusicBrainz(candidateTitle);
     if (metadataTitle) {
       return {
         title: metadataTitle,
@@ -224,29 +265,8 @@ export class TranscriptionService {
       };
     }
 
-    const transcriptionLanguage = this.getTranscriptionLanguage();
-
-    const promptTitle = await this.extractSongTitleWithPromptApi(normalizedText, transcriptionLanguage);
-    if (promptTitle) {
-      return {
-        title: promptTitle,
-        source: 'transcription'
-      };
-    }
-
-    const apiKey = this.getApiKey();
-    if (apiKey) {
-      const geminiTitle = await this.extractSongTitleWithGemini(normalizedText, apiKey, transcriptionLanguage);
-      if (geminiTitle) {
-        return {
-          title: geminiTitle,
-          source: 'transcription'
-        };
-      }
-    }
-
     return {
-      title: this.normalizeTitle(this.fallbackRegexExtraction(normalizedText)),
+      title: candidateTitle,
       source: 'transcription'
     };
   }
@@ -257,45 +277,54 @@ export class TranscriptionService {
     transcriptionLanguage: TranscriptionLanguageCode
   ): Promise<string> {
     const base64Data = await this.blobToBase64(audioBlob);
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+    const data = await this.requestGeminiContent(apiKey, [
       {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: 'audio/wav',
-                    data: base64Data
-                  }
-                },
-                {
-                  text: this.buildTranscriptionInstruction(transcriptionLanguage)
-                }
-              ]
-            }
-          ]
-        })
+        inlineData: {
+          mimeType: 'audio/wav',
+          data: base64Data
+        }
+      },
+      {
+        text: this.buildTranscriptionInstruction(transcriptionLanguage)
       }
-    );
+    ]);
+
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) {
+      throw new Error('Invalid response from Gemini API');
+    }
+
+    const normalized = this.normalizeModelText(text);
+    return this.isLikelyNonTranscript(normalized) ? '' : normalized;
+  }
+
+  private async requestGeminiContent(apiKey: string, parts: unknown[]): Promise<GeminiGenerateContentResponse> {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+    const requestInit: RequestInit = {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        contents: [{ parts }],
+        generationConfig: {
+          temperature: 0
+        }
+      })
+    };
+
+    let response = await fetch(url, requestInit);
+    if (response.status === 429 || response.status === 503) {
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      response = await fetch(url, requestInit);
+    }
 
     if (!response.ok) {
       const errorText = await response.text();
       throw new Error(`Gemini API Error: ${response.status} - ${errorText}`);
     }
 
-    const data = await response.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) {
-      throw new Error('Invalid response from Gemini API');
-    }
-
-    return text.trim();
+    return await response.json() as GeminiGenerateContentResponse;
   }
 
   private fallbackRegexExtraction(text: string): string {
@@ -311,8 +340,7 @@ export class TranscriptionService {
     audioBlob: Blob,
     transcriptionLanguage: TranscriptionLanguageCode
   ): Promise<string | null> {
-    const globalObj = globalThis as PromptApiGlobal;
-    if (!globalObj.LanguageModel) {
+    if (!this.getPromptApiModel()) {
       this.promptApiDiagnostics.next(this.buildPromptApiDiagnostics('unsupported'));
       return null;
     }
@@ -340,7 +368,8 @@ export class TranscriptionService {
       ]);
 
       this.promptApiDiagnostics.next(this.buildPromptApiDiagnostics('available'));
-      return this.normalizeModelText(result);
+      const normalized = this.normalizeModelText(result);
+      return this.isLikelyNonTranscript(normalized) ? '' : normalized;
     } catch (error) {
       this.promptApiDiagnostics.next(
         this.buildPromptApiDiagnostics('error', this.formatPromptApiError(error), 'Prompt API audio prompt failed after session creation.')
@@ -379,32 +408,12 @@ export class TranscriptionService {
     transcriptionLanguage: TranscriptionLanguageCode
   ): Promise<string | null> {
     try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+      const data = await this.requestGeminiContent(apiKey, [
         {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  {
-                    text: this.buildTitleExtractionInstruction(rawText, transcriptionLanguage)
-                  }
-                ]
-              }
-            ]
-          })
+          text: this.buildTitleExtractionInstruction(rawText, transcriptionLanguage)
         }
-      );
+      ]);
 
-      if (!response.ok) {
-        return null;
-      }
-
-      const data = await response.json();
       const result = data?.candidates?.[0]?.content?.parts?.[0]?.text;
       return result ? this.normalizeTitle(this.normalizeModelText(result)) : null;
     } catch (error) {
@@ -417,14 +426,16 @@ export class TranscriptionService {
     const searchQueries = this.buildMusicBrainzSearchQueries(rawText);
 
     for (const query of searchQueries) {
-      const recordingTitle = await this.lookupMusicBrainzRecordingTitle(query);
-      if (recordingTitle) {
-        return recordingTitle;
-      }
-
+      // Rehearsal pieces are usually classical/concert works, so search works
+      // first; recordings are the fallback for non-classical material.
       const workTitle = await this.lookupMusicBrainzWorkTitle(query);
       if (workTitle) {
         return workTitle;
+      }
+
+      const recordingTitle = await this.lookupMusicBrainzRecordingTitle(query);
+      if (recordingTitle) {
+        return recordingTitle;
       }
     }
 
@@ -460,8 +471,9 @@ export class TranscriptionService {
   private buildTranscriptionInstruction(language: TranscriptionLanguageCode): string {
     const languageInstruction = this.getTranscriptionLanguageInstruction(language);
     return [
-      'Transcribe the spoken audio in this quiet gap before a song.',
-      // 'Focus on DJ intros that mention the next artist or song title.',
+      'Transcribe the spoken audio in this gap from an ensemble rehearsal, before a piece of music is played.',
+      'Someone may announce the name of the piece, its composer, movement, or opus/catalog number some time before it is played. Pay attention to those announcements.',
+      'Transcribe speech verbatim; do not summarize, describe the audio, or add commentary.',
       languageInstruction,
       'Return only the transcript text.',
       'If there is no intelligible speech, return an empty string.'
@@ -474,10 +486,11 @@ export class TranscriptionService {
       : `The transcript is expected to be in ${this.getLanguageOption(language).promptLabel}. Preserve artist names, song titles, and any summary text in ${this.getLanguageOption(language).promptLabel} when possible. Do not translate to English.`;
 
     return [
-      'This transcript was captured from speech immediately before a song.',
-      'Extract a concise MP3 title.',
-      'Prefer the format "Artist - Song Title".',
-      'If only the song title or artist is clear, return that.',
+      'This transcript was captured from speech during an ensemble rehearsal, before a piece of music was played.',
+      'Extract a concise MP3 title for the piece that follows.',
+      'Prefer the format "Composer - Piece Title" for classical music, or "Artist - Song Title" otherwise.',
+      'Preserve any movement numbers, opus or catalog numbers, and keys mentioned (e.g. "Symphony No. 5 in C minor, Op. 67").',
+      'If only the piece title or composer is clear, return that.',
       'If no title is mentioned, return a short 2-5 word summary.',
       languageInstruction,
       `Transcript: "${rawText}"`
@@ -495,6 +508,11 @@ export class TranscriptionService {
   private getLanguageOption(language: TranscriptionLanguageCode): TranscriptionLanguageOption {
     return TRANSCRIPTION_LANGUAGE_OPTIONS.find(option => option.value === language)
       ?? TRANSCRIPTION_LANGUAGE_OPTIONS[0];
+  }
+
+  private isPromptApiLanguageSupported(language: TranscriptionLanguageCode): boolean {
+    return language === 'auto'
+      || (SUPPORTED_PROMPT_API_LANGUAGES as ReadonlyArray<string>).includes(language);
   }
 
   private getPromptApiLanguages(language: TranscriptionLanguageCode): ReadonlyArray<PromptApiLanguageCode> {
@@ -669,6 +687,35 @@ export class TranscriptionService {
     }
   }
 
+  /**
+   * Detects model meta-responses ("there is no speech", "I cannot transcribe...")
+   * that describe the audio instead of transcribing it, so they are treated as
+   * an empty transcript rather than becoming a track title.
+   */
+  private isLikelyNonTranscript(text: string): boolean {
+    const normalized = text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!normalized) {
+      return true;
+    }
+
+    const metaResponsePatterns = [
+      /^(there is|there s) (no|nothing|not)\b/,
+      /^no (speech|spoken|audio|intelligible|words|voice|discernible)\b/,
+      /^(i m sorry|i cannot|i can t|i am unable|sorry)\b/,
+      /^(unable|cannot) to (transcribe|hear|detect|understand)\b/,
+      /^the (audio|recording|clip|file) (is|contains|does|appears|sounds)\b/,
+      /^(this|it) (is|sounds|appears) (silent|silence|inaudible|quiet|empty|music|instrumental)\b/,
+      /^(silence|silent|inaudible|unintelligible|no speech)$/
+    ];
+
+    return metaResponsePatterns.some(pattern => pattern.test(normalized));
+  }
+
   private normalizeModelText(value: unknown): string {
     if (typeof value !== 'string') {
       return '';
@@ -708,36 +755,62 @@ export class TranscriptionService {
       .filter(token => !this.isLikelyPresenterFiller(token));
     const compactQuery = filteredTokens.slice(0, 14).join(' ').trim();
     const bySplit = normalized.split(/\s+by\s+/i).map(part => part.trim()).filter(Boolean);
+    // Title candidates usually arrive as "Artist - Title"; also search the
+    // combined form and each side of the dash separately.
+    const dashSplit = normalized.split(/\s+-\s+/).map(part => part.trim()).filter(Boolean);
+    const dashJoined = dashSplit.join(' ');
 
     return Array.from(new Set([
       normalized.slice(0, 160),
+      dashJoined,
       compactQuery,
-      ...bySplit
+      ...bySplit,
+      ...dashSplit
     ].filter(query => query.length >= 4)));
   }
 
   private isLikelyPresenterFiller(token: string): boolean {
     const normalized = token.toLowerCase().replace(/[^a-z0-9]/g, '');
     return new Set([
+      'again',
       'and',
       'coming',
+      'everyone',
+      'everybody',
+      'gonna',
       'heard',
       'here',
       'intro',
       'just',
+      'let',
+      'lets',
       'listen',
       'listening',
       'next',
       'now',
+      'ok',
+      'okay',
+      'play',
+      'playing',
+      'please',
       'radio',
+      'ready',
+      'rehearsal',
+      'shall',
+      'so',
       'song',
       'that',
       'the',
       'this',
       'track',
+      'uh',
+      'um',
       'up',
+      'us',
       'was',
+      'well',
       'were',
+      'will',
       'with',
       'you',
       'your'

@@ -1,13 +1,15 @@
 # Web Audio Tools
 
-This workspace contains a browser-only Angular app that slices large WAV files into MP3 tracks without a Node server.
+This workspace contains a browser-only Angular app that slices large WAV files (e.g. ensemble rehearsal recordings) into MP3 tracks without a Node server.
 
 ## What it does
 
 - Streams WAV input with the File API and parses PCM incrementally instead of loading the whole file into memory.
 - Detects song regions by watching dB level transitions between `SILENCE` and `SONG` windows.
 - Encodes each detected song to MP3 in a Web Worker with `lamejs`.
-- Transcribes quiet intro gaps and uses the text before each song to name the next MP3 file.
+- Transcribes spoken announcements (someone naming the piece before it is played) and uses that text to name the next MP3 file.
+- Captures short loud regions too: a spoken announcement above the silence threshold is transcribed instead of being discarded as a too-short track.
+- Prepares gap audio for transcription: mono downmix, 16 kHz resample, silence trimming, long-pause compression, and peak normalization.
 - Exposes track and segment state to compatible browser agents through WebMCP.
 
 ## AI strategy

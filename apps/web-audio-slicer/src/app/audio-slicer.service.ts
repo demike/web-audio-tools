@@ -1,6 +1,6 @@
 import { Injectable, inject } from '@angular/core';
 import { BehaviorSubject, Subject } from 'rxjs';
-import { WavStreamParser, calculateRms, rmsToDb, createWavBlob } from './audio-helper';
+import { WavStreamParser, calculateRms, rmsToDb, createWavBlob, prepareSpeechAudio } from './audio-helper';
 import { TranscriptionService } from './transcription.service';
 
 export interface Track {
@@ -178,6 +178,28 @@ export class AudioSlicerService {
     let silenceTimerSec = 0;
     let silenceDropStartSec = 0;
 
+    // Short-song capture: in ensemble rehearsals, spoken announcements can be
+    // louder than the silence threshold yet shorter than minSongDuration.
+    // Buffer such regions so they can be transcribed instead of discarded.
+    let shortSongBuffer: Float32Array[][] = [];
+    let shortSongBufferSec = 0;
+    let shortSongBufferComplete = false;
+
+    const captureShortSongWindow = (windowChannels: Float32Array[], windowDuration: number): void => {
+      if (shortSongBufferComplete) {
+        return;
+      }
+
+      shortSongBuffer = this.appendChannelChunks(shortSongBuffer, windowChannels);
+      shortSongBufferSec += windowDuration;
+
+      if (shortSongBufferSec >= this.minSongDuration) {
+        // Long enough to be a real piece; release the buffer to save memory.
+        shortSongBuffer = [];
+        shortSongBufferComplete = true;
+      }
+    };
+
     // RMS analysis window settings
     const windowSize = 8192; // ~185ms at 44.1kHz
     let analysisLeftover: Float32Array[] = [];
@@ -210,7 +232,11 @@ export class AudioSlicerService {
       }
 
       const windowDuration = windowSampleCount / sampleRate;
-      const rms = calculateRms(windowChannels[0]); // Analyze left channel for silence
+      // Analyze the loudest channel so speech panned away from the left is not missed.
+      let rms = 0;
+      for (const channel of windowChannels) {
+        rms = Math.max(rms, calculateRms(channel));
+      }
       const db = rmsToDb(rms);
       const currentTime = totalSamplesProcessed / sampleRate;
       const progressTime = (totalSamplesProcessed + windowSampleCount) / sampleRate;
@@ -283,6 +309,11 @@ export class AudioSlicerService {
 
           this.initMp3Worker(this.getMp3ExportChannelCount(numChannels), sampleRate, newTrack.key);
           this.feedSamplesToWorker(windowChannels);
+
+          shortSongBuffer = this.createChannelChunkBuffers(numChannels);
+          shortSongBufferSec = 0;
+          shortSongBufferComplete = false;
+          captureShortSongWindow(windowChannels, windowDuration);
         } else {
           if (currentSilenceBuffer.length === 0) {
             silenceStartSec = currentTime;
@@ -298,6 +329,7 @@ export class AudioSlicerService {
           }
 
           pendingSilenceBuffer = this.appendChannelChunks(pendingSilenceBuffer, windowChannels);
+          captureShortSongWindow(windowChannels, windowDuration);
           silenceTimerSec += windowDuration;
 
           if (silenceTimerSec >= this.minSilenceDuration) {
@@ -317,9 +349,34 @@ export class AudioSlicerService {
               nextTrackIndex++;
               this.finishMp3Worker();
             } else if (currentSongTrack) {
+              // Short regions are usually spoken announcements, count-offs, or
+              // tuning. Transcribe them for the next track instead of dropping
+              // the audio on the floor.
+              if (!shortSongBufferComplete && songDuration > 0.5 && this.hasChannelChunks(shortSongBuffer)) {
+                silenceSegmentCounter++;
+                const segment: SilenceSegment = {
+                  id: silenceSegmentCounter,
+                  startTime: songStartSec,
+                  endTime: songEndSec,
+                  duration: songDuration,
+                  text: null,
+                  status: 'transcribing'
+                };
+
+                this.registerSilenceSegment(
+                  segment,
+                  this.mergeChannelChunks(shortSongBuffer),
+                  sampleRate,
+                  trackKeyCounter + 1,
+                  transcribeSpeechGaps
+                );
+              }
               this.discardCurrentTrack(currentSongTrack.key);
             }
 
+            shortSongBuffer = [];
+            shortSongBufferSec = 0;
+            shortSongBufferComplete = false;
             currentSongTrack = null;
 
             silenceStartSec = silenceDropStartSec;
@@ -335,6 +392,7 @@ export class AudioSlicerService {
           }
 
           this.feedSamplesToWorker(windowChannels);
+          captureShortSongWindow(windowChannels, windowDuration);
         }
       }
     };
@@ -814,30 +872,38 @@ export class AudioSlicerService {
   }
 
   // --- Transcription and AI Refinement ---
+  private setSegmentStatus(segmentId: number, status: SilenceSegment['status'], text: string | null): void {
+    const currentSegments = this.segments.getValue();
+    const updatedSegments = currentSegments.map(s =>
+      s.id === segmentId ? { ...s, status, text } : s
+    );
+    this.segments.next(updatedSegments);
+  }
+
   private transcribeSegmentInBackground(
     segment: SilenceSegment,
     pcmBuffer: Float32Array[],
     sampleRate: number,
     targetTrackKey: number
   ): void {
+    // Downmix, resample, trim dead air, and normalize before transcription so
+    // the model hears focused, audible speech instead of minutes of faint gap audio.
+    const speechAudio = prepareSpeechAudio(pcmBuffer, sampleRate);
+    if (!speechAudio) {
+      this.setSegmentStatus(segment.id, 'skipped', 'No audible speech detected in this gap.');
+      return;
+    }
+
+    const speechWavBlob = createWavBlob([speechAudio.samples], speechAudio.sampleRate);
+
     this.transcriptionService.hasTranscriptionProvider()
       .then(hasProvider => {
         if (!hasProvider) {
-          const currentSegments = this.segments.getValue();
-          const updatedSegments = currentSegments.map(s =>
-            s.id === segment.id
-              ? {
-                  ...s,
-                  status: 'skipped' as const,
-                  text: 'Transcription skipped: no Prompt API or Gemini API key is available.'
-                }
-              : s
-          );
-          this.segments.next(updatedSegments);
+          this.setSegmentStatus(segment.id, 'skipped', 'Transcription skipped: no Prompt API or Gemini API key is available.');
           return null;
         }
 
-        return this.transcriptionService.transcribeAudio(createWavBlob(pcmBuffer, sampleRate));
+        return this.transcriptionService.transcribeAudio(speechWavBlob);
       })
       .then(async text => {
         if (text === null) {
@@ -869,7 +935,10 @@ export class AudioSlicerService {
 
         const extractedTitle = await this.transcriptionService.extractSongTitle(text);
         if (extractedTitle) {
-          this.updateTrackTitleByKey(targetTrackKey, extractedTitle.title, extractedTitle.source);
+          const targetTrack = this.tracks.getValue().find(t => t.key === targetTrackKey);
+          if (targetTrack && targetTrack.titleSource !== 'manual') {
+            this.updateTrackTitleByKey(targetTrackKey, extractedTitle.title, extractedTitle.source);
+          }
         }
       })
       .catch(err => {

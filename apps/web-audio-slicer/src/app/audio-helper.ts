@@ -257,6 +257,203 @@ export function rmsToDb(rms: number): number {
   return 20 * Math.log10(rms);
 }
 
+export interface PreparedSpeechAudio {
+  samples: Float32Array;
+  sampleRate: number;
+}
+
+export interface SpeechAudioOptions {
+  /** Target sample rate for speech recognition. Never upsamples. Defaults to 16000. */
+  targetSampleRate?: number;
+  /** RMS threshold used to trim leading/trailing silence. Defaults to -60 dB. */
+  trimThresholdDb?: number;
+  /** Maximum duration sent for transcription; only the tail is kept when exceeded. Defaults to 360 s. */
+  maxDurationSec?: number;
+  /** Internal silence runs longer than this are compressed. Defaults to 1 s. */
+  maxInternalSilenceSec?: number;
+  /** How much of each long internal silence run is kept. Defaults to 0.5 s. */
+  keptInternalSilenceSec?: number;
+  /** Peak level after normalization (0..1). Defaults to ~-3 dBFS. */
+  targetPeak?: number;
+}
+
+/**
+ * Prepares buffered rehearsal gap audio for speech transcription:
+ * downmixes to mono, resamples to a speech-friendly rate, trims dead air,
+ * compresses long internal pauses (tuning, discussion) while keeping all
+ * speech, and peak-normalizes quiet speech so the transcriber hears it at a
+ * usable level. Announcements can happen well before the piece starts, so
+ * speech anywhere in the gap is preserved.
+ *
+ * Returns null when the gap contains no audible content.
+ */
+export function prepareSpeechAudio(
+  channelsData: Float32Array[],
+  sampleRate: number,
+  options: SpeechAudioOptions = {}
+): PreparedSpeechAudio | null {
+  const targetSampleRate = options.targetSampleRate ?? 16000;
+  const trimThresholdDb = options.trimThresholdDb ?? -60;
+  const maxDurationSec = options.maxDurationSec ?? 360;
+  const maxInternalSilenceSec = options.maxInternalSilenceSec ?? 1.0;
+  const keptInternalSilenceSec = options.keptInternalSilenceSec ?? 0.5;
+  const targetPeak = options.targetPeak ?? 0.707;
+
+  const sampleCount = channelsData[0]?.length ?? 0;
+  if (sampleCount === 0 || sampleRate <= 0) {
+    return null;
+  }
+
+  // 1. Downmix to mono.
+  let mono: Float32Array;
+  if (channelsData.length === 1) {
+    mono = channelsData[0];
+  } else {
+    mono = new Float32Array(sampleCount);
+    for (const channel of channelsData) {
+      for (let i = 0; i < sampleCount; i++) {
+        mono[i] += channel[i];
+      }
+    }
+    for (let i = 0; i < sampleCount; i++) {
+      mono[i] /= channelsData.length;
+    }
+  }
+
+  // 2. Resample (linear interpolation) to the speech target rate; never upsample.
+  const outputRate = Math.min(sampleRate, targetSampleRate);
+  if (outputRate !== sampleRate) {
+    const ratio = sampleRate / outputRate;
+    const outputLength = Math.floor(sampleCount / ratio);
+    const resampled = new Float32Array(outputLength);
+    for (let i = 0; i < outputLength; i++) {
+      const position = i * ratio;
+      const index = Math.floor(position);
+      const fraction = position - index;
+      const a = mono[index];
+      const b = mono[Math.min(index + 1, sampleCount - 1)];
+      resampled[i] = a + (b - a) * fraction;
+    }
+    mono = resampled;
+  }
+
+  // 3. Trim leading/trailing silence with a generous threshold and small padding.
+  const trimWindowSize = Math.max(1, Math.round(outputRate * 0.02)); // 20 ms windows
+  const trimThresholdRms = Math.pow(10, trimThresholdDb / 20);
+  let firstActiveWindow = -1;
+  let lastActiveWindow = -1;
+  const windowCount = Math.ceil(mono.length / trimWindowSize);
+
+  for (let w = 0; w < windowCount; w++) {
+    const start = w * trimWindowSize;
+    const end = Math.min(start + trimWindowSize, mono.length);
+    let sum = 0;
+    for (let i = start; i < end; i++) {
+      sum += mono[i] * mono[i];
+    }
+    if (Math.sqrt(sum / (end - start)) > trimThresholdRms) {
+      if (firstActiveWindow === -1) {
+        firstActiveWindow = w;
+      }
+      lastActiveWindow = w;
+    }
+  }
+
+  if (firstActiveWindow === -1) {
+    return null;
+  }
+
+  const paddingSamples = Math.round(outputRate * 0.1); // keep 100 ms around speech
+  const trimStart = Math.max(0, firstActiveWindow * trimWindowSize - paddingSamples);
+  const trimEnd = Math.min(mono.length, (lastActiveWindow + 1) * trimWindowSize + paddingSamples);
+  let trimmed = mono.subarray(trimStart, trimEnd);
+
+  // 4. Compress long internal pauses (tuning, discussion between the
+  // announcement and the piece) while keeping every speech region intact.
+  const silenceRunLimit = Math.round(maxInternalSilenceSec * outputRate);
+  const silenceKeep = Math.round(keptInternalSilenceSec * outputRate);
+  const pieces: Float32Array[] = [];
+  let pendingSilence: Float32Array[] = [];
+  let pendingSilenceSamples = 0;
+
+  const flushSilenceRun = (): void => {
+    if (pendingSilenceSamples === 0) {
+      return;
+    }
+
+    if (pendingSilenceSamples <= silenceRunLimit) {
+      pieces.push(...pendingSilence);
+    } else {
+      let kept = 0;
+      for (const piece of pendingSilence) {
+        if (kept >= silenceKeep) {
+          break;
+        }
+        const take = Math.min(piece.length, silenceKeep - kept);
+        pieces.push(piece.subarray(0, take));
+        kept += take;
+      }
+    }
+
+    pendingSilence = [];
+    pendingSilenceSamples = 0;
+  };
+
+  for (let i = 0; i < trimmed.length; i += trimWindowSize) {
+    const end = Math.min(i + trimWindowSize, trimmed.length);
+    let sum = 0;
+    for (let j = i; j < end; j++) {
+      sum += trimmed[j] * trimmed[j];
+    }
+    const isActive = Math.sqrt(sum / (end - i)) > trimThresholdRms;
+
+    if (isActive) {
+      flushSilenceRun();
+      pieces.push(trimmed.subarray(i, end));
+    } else {
+      pendingSilence.push(trimmed.subarray(i, end));
+      pendingSilenceSamples += end - i;
+    }
+  }
+  flushSilenceRun();
+
+  const compressedLength = pieces.reduce((sum, piece) => sum + piece.length, 0);
+  let compressed = new Float32Array(compressedLength);
+  let offset = 0;
+  for (const piece of pieces) {
+    compressed.set(piece, offset);
+    offset += piece.length;
+  }
+
+  // 5. Safety cap for extremely long gaps; keep the tail when exceeded.
+  const maxSamples = Math.round(maxDurationSec * outputRate);
+  if (compressed.length > maxSamples) {
+    compressed = compressed.subarray(compressed.length - maxSamples);
+  }
+  trimmed = compressed;
+
+  // 6. Peak-normalize so faint speech reaches a usable level.
+  let peak = 0;
+  for (let i = 0; i < trimmed.length; i++) {
+    const magnitude = Math.abs(trimmed[i]);
+    if (magnitude > peak) {
+      peak = magnitude;
+    }
+  }
+
+  if (peak <= 0) {
+    return null;
+  }
+
+  const gain = targetPeak / peak;
+  const normalized = new Float32Array(trimmed.length);
+  for (let i = 0; i < trimmed.length; i++) {
+    normalized[i] = Math.max(-1, Math.min(1, trimmed[i] * gain));
+  }
+
+  return { samples: normalized, sampleRate: outputRate };
+}
+
 /**
  * Creates a WAV file Blob in memory from Float32 PCM channel buffers.
  */

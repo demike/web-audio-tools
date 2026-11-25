@@ -107,7 +107,7 @@
               }
             </select>
           </div>
-          <p class="help-text">Use Auto detect to keep the spoken language instead of translating everything to English. Transcript text is also searched against MusicBrainz before the app falls back to AI title extraction.</p>
+          <p class="help-text">Use Auto detect to keep the spoken language instead of translating everything to English. AI extracts a title candidate from the transcript first, then MusicBrainz verifies it against known recordings and works.</p>
         </div>
 
         <div class="setting-item">
@@ -246,7 +246,7 @@
                   type="checkbox"
                   [(ngModel)]="transcribeSpeechGapsOnStart"
                 />
-                <span>Transcribe speech gaps for automatic track naming</span>
+                <span>Transcribe spoken announcements for automatic track naming</span>
               </label>
 
               <p class="help-text analysis-option-help">
@@ -276,7 +276,7 @@
       } @else {
         <div class="no-file-loaded">
           <i class="fa-solid fa-info-circle text-purple"></i>
-          <span>Upload a WAV file to start slicing. The WAV is parsed as a <strong>Web Stream</strong>, songs are encoded to MP3 in a worker, and quiet intro gaps are transcribed for track naming.</span>
+          <span>Upload a WAV file to start slicing. The WAV is parsed as a <strong>Web Stream</strong>, pieces are encoded to MP3 in a worker, and spoken announcements before each piece are transcribed for track naming.</span>
         </div>
       }
     </section>
@@ -436,7 +436,7 @@
               <!-- Speech Transcript Preview -->
               @if (track.transcription) {
                 <div class="track-transcript-bubble">
-                  <div class="bubble-title"><i class="fa-solid fa-quote-left text-purple"></i> Spoken Intro (Transcribed)</div>
+                  <div class="bubble-title"><i class="fa-solid fa-quote-left text-purple"></i> Spoken Announcement (Transcribed)</div>
                   <p class="bubble-text">"{{ track.transcription }}"</p>
                 </div>
               }
@@ -471,7 +471,7 @@
     <section class="card-panel glass-panel segments-section">
       <div class="expandable-header">
         <h2><i class="fa-solid fa-file-waveform text-accent"></i> Speech Segment & AI Transcription Log</h2>
-        <p class="section-desc">Quiet gaps are transcribed first, then their text is used to name the following MP3 slice.</p>
+        <p class="section-desc">Spoken announcements and quiet gaps before each piece are transcribed, then their text is used to name the following MP3 slice.</p>
       </div>
 
       <div class="segments-table-wrapper">

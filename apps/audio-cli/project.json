@@ -12,9 +12,6 @@
         "command": "esbuild apps/audio-cli/src/main.ts --bundle --platform=node --format=cjs --target=node18 --outfile=dist/apps/audio-cli/main.js --tsconfig=apps/audio-cli/tsconfig.app.json"
       }
     },
-    "lint": {
-      "executor": "@nx/eslint:lint"
-    },
     "test": {
       "executor": "nx:run-commands",
       "options": {

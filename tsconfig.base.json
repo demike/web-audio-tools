@@ -15,7 +15,8 @@
     "skipDefaultLibCheck": true,
     "paths": {
       "@web-audio-tools/audio-core": ["./libs/audio-core/src/index.ts"]
-    }
+    },
+    "ignoreDeprecations": "6.0"
   },
   "exclude": ["node_modules", "tmp"]
 }

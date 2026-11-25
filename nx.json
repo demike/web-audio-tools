@@ -16,16 +16,34 @@
       "dependsOn": ["^build"],
       "inputs": ["production", "^production"]
     },
-    "@nx/eslint:lint": {
-      "cache": true,
-      "inputs": [
-        "default",
-        "^default",
-        "{workspaceRoot}/.eslintrc.json",
-        "{workspaceRoot}/.eslintignore",
-        "{workspaceRoot}/eslint.config.mjs",
-        "{workspaceRoot}/tools/eslint-rules/**/*"
-      ]
+    "lint": [
+      {
+        "filter": {
+          "plugin": "@nx/eslint/plugin"
+        },
+        "inputs": [
+          "default",
+          "^default",
+          "{workspaceRoot}/.eslintrc.json",
+          "{workspaceRoot}/.eslintignore",
+          "{workspaceRoot}/eslint.config.mjs",
+          "{workspaceRoot}/tools/eslint-rules/**/*",
+          {
+            "externalDependencies": ["eslint"]
+          }
+        ]
+      }
+    ]
+  },
+  "affected": {
+    "legacy": true
+  },
+  "plugins": [
+    {
+      "plugin": "@nx/eslint/plugin",
+      "options": {
+        "targetName": "lint"
+      }
     }
-  }
+  ]
 }

@@ -47,3 +47,5 @@ Thumbs.db
 
 # local dev SSL cert
 .ssl
+
+.nx/migrate-runs

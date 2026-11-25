@@ -499,7 +499,7 @@
                 <!-- Audio Preview Player -->
                 @if (track.status === 'done') {
                   <div class="player-wrapper">
-                    <audio [src]="track.mp3Url" controls class="html5-player"></audio>
+                    <audio [src]="track.mp3Url" controls class="html5-player" (play)="pauseOtherPlayers($event)"></audio>
                   </div>
                 }
 

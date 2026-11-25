@@ -109,4 +109,14 @@ describe('App component', () => {
     expect(component.editingTitle).toBe('Track 1');
     expect(component.openMenuTrackId).toBeNull();
   });
+
+  it('pauses other players when one starts playing', () => {
+    const current = { pause: vi.fn() } as unknown as HTMLAudioElement;
+    const other = { pause: vi.fn() } as unknown as HTMLAudioElement;
+    const spy = vi.spyOn(document, 'querySelectorAll').mockReturnValue([current, other] as unknown as NodeListOf<HTMLAudioElement>);
+    component.pauseOtherPlayers({ target: current } as unknown as Event);
+    expect(other.pause).toHaveBeenCalled();
+    expect(current.pause).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
 });

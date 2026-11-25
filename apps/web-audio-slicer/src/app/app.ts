@@ -300,6 +300,16 @@ export class App implements OnInit, OnDestroy {
     this.cdr.markForCheck();
   }
 
+  /** Ensures only one track player is active at a time. */
+  public pauseOtherPlayers(event: Event): void {
+    const current = event.target as HTMLAudioElement;
+    document.querySelectorAll<HTMLAudioElement>('audio.html5-player').forEach(player => {
+      if (player !== current) {
+        player.pause();
+      }
+    });
+  }
+
   // --- Download Helpers ---
   public downloadTrack(track: Track): void {
     if (!track.mp3Url || !track.mp3Blob) return;

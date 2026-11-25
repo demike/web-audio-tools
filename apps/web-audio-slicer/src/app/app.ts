@@ -1,4 +1,4 @@
-import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef, inject } from '@angular/core';
+import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef, HostListener, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { AudioSlicerService, Track, SilenceSegment, SlicerState } from './audio-slicer.service';
@@ -47,6 +47,8 @@ export class App implements OnInit, OnDestroy {
   public minSilenceDuration = 2.5;
   public minSongDuration = 8.0;
   public mp3Bitrate = 192;
+  public preRollSec = 0.3;
+  public postRollSec = 0.5;
   public transcribeSpeechGapsOnStart = true;
   public trackStartIndex = 1;
 
@@ -59,6 +61,8 @@ export class App implements OnInit, OnDestroy {
   public webMcpStatus: 'unsupported' | 'active' = 'unsupported';
   public showSettings = false;
   public isDragOver = false;
+  public isDownloadingModel = false;
+  public modelDownloadProgress: number | null = null;
 
   // Visualizer history
   public volumeHistory: number[] = Array(80).fill(-100);
@@ -66,6 +70,7 @@ export class App implements OnInit, OnDestroy {
   // Track editing state
   public editingTrackId: number | null = null;
   public editingTitle = '';
+  public openMenuTrackId: number | null = null;
 
   private readonly audioSlicerService = inject(AudioSlicerService);
   private readonly transcriptionService = inject(TranscriptionService);
@@ -81,6 +86,8 @@ export class App implements OnInit, OnDestroy {
     this.minSilenceDuration = this.audioSlicerService.minSilenceDuration;
     this.minSongDuration = this.audioSlicerService.minSongDuration;
     this.mp3Bitrate = this.audioSlicerService.mp3Bitrate;
+    this.preRollSec = this.audioSlicerService.preRollSec;
+    this.postRollSec = this.audioSlicerService.postRollSec;
 
     // 2. Subscriptions
     this.subs.push(
@@ -136,6 +143,8 @@ export class App implements OnInit, OnDestroy {
     this.audioSlicerService.minSilenceDuration = Number(this.minSilenceDuration);
     this.audioSlicerService.minSongDuration = Number(this.minSongDuration);
     this.audioSlicerService.mp3Bitrate = Number(this.mp3Bitrate);
+    this.audioSlicerService.preRollSec = Number(this.preRollSec);
+    this.audioSlicerService.postRollSec = Number(this.postRollSec);
     this.showSettings = false;
     if (typeof window !== 'undefined') {
       void this.transcriptionService.refreshPromptApiDiagnostics();
@@ -158,6 +167,30 @@ export class App implements OnInit, OnDestroy {
 
   public get hasGeminiFallbackConfigured(): boolean {
     return this.apiKey.trim().length > 0;
+  }
+
+  /** Re-check Prompt API availability without a page reload. */
+  public async refreshPromptApiStatus(): Promise<void> {
+    await this.transcriptionService.refreshPromptApiDiagnostics();
+    this.cdr.markForCheck();
+  }
+
+  /** Triggered by a button click so Chrome has the user activation it requires. */
+  public async downloadOnDeviceModel(): Promise<void> {
+    this.isDownloadingModel = true;
+    this.modelDownloadProgress = 0;
+    this.cdr.markForCheck();
+
+    try {
+      await this.transcriptionService.downloadPromptApiModel(fraction => {
+        this.modelDownloadProgress = Math.round(fraction * 100);
+        this.cdr.markForCheck();
+      });
+    } finally {
+      this.isDownloadingModel = false;
+      this.modelDownloadProgress = null;
+      this.cdr.markForCheck();
+    }
   }
 
   // --- Drag & Drop / File Handling ---
@@ -229,6 +262,42 @@ export class App implements OnInit, OnDestroy {
 
   public cancelEditing(): void {
     this.editingTrackId = null;
+  }
+
+  // --- Track Context Menu ---
+  @HostListener('document:click')
+  public onDocumentClick(): void {
+    if (this.openMenuTrackId !== null) {
+      this.openMenuTrackId = null;
+      this.cdr.markForCheck();
+    }
+  }
+
+  public toggleTrackMenu(trackId: number, event: Event): void {
+    event.stopPropagation();
+    this.openMenuTrackId = this.openMenuTrackId === trackId ? null : trackId;
+    this.cdr.markForCheck();
+  }
+
+  public closeTrackMenu(): void {
+    this.openMenuTrackId = null;
+    this.cdr.markForCheck();
+  }
+
+  public menuRename(track: Track): void {
+    this.closeTrackMenu();
+    this.startEditing(track);
+  }
+
+  public menuDownload(track: Track): void {
+    this.closeTrackMenu();
+    this.downloadTrack(track);
+  }
+
+  public removeTrack(track: Track): void {
+    this.closeTrackMenu();
+    this.audioSlicerService.removeTrack(track.id);
+    this.cdr.markForCheck();
   }
 
   // --- Download Helpers ---

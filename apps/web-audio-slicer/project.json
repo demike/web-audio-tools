@@ -49,6 +49,12 @@
     "serve": {
       "continuous": true,
       "executor": "@angular/build:dev-server",
+      "options": {
+        "host": "0.0.0.0",
+        "ssl": true,
+        "sslKey": ".ssl/key.pem",
+        "sslCert": ".ssl/cert.pem"
+      },
       "configurations": {
         "production": {
           "buildTarget": "web-audio-slicer:build:production"

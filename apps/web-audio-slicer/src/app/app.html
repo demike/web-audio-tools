@@ -85,6 +85,28 @@
 
             <p class="help-text">{{ promptApiDiagnostics.detail }}</p>
 
+            <button class="btn btn-secondary btn-sm" (click)="refreshPromptApiStatus()">
+              <i class="fa-solid fa-rotate"></i> Re-check status
+            </button>
+
+            @if (promptApiDiagnostics.status === 'downloadable' || promptApiDiagnostics.status === 'downloading') {
+              <div class="model-download-block">
+                <button
+                  class="btn btn-secondary w-full"
+                  (click)="downloadOnDeviceModel()"
+                  [disabled]="isDownloadingModel"
+                >
+                  <i class="fa-solid" [ngClass]="isDownloadingModel ? 'fa-spinner fa-spin' : 'fa-download'"></i>
+                  {{ isDownloadingModel ? 'Downloading on-device model…' : 'Download on-device model' }}
+                </button>
+                @if (modelDownloadProgress !== null) {
+                  <progress class="model-download-progress" max="100" [value]="modelDownloadProgress"></progress>
+                  <p class="help-text">{{ modelDownloadProgress }}%</p>
+                }
+                <p class="help-text">Chrome downloads Gemini Nano once (~several GB). Keep this tab open until it finishes.</p>
+              </div>
+            }
+
             @if (promptApiDiagnostics.lastError) {
               <p class="help-text text-danger">Last runtime error: {{ promptApiDiagnostics.lastError }}</p>
             }
@@ -156,6 +178,38 @@
             />
           </div>
           <p class="help-text">Slices shorter than this will be ignored (e.g. noise).</p>
+        </div>
+
+        <div class="setting-item">
+          <label for="pre-roll">Pre-roll Padding (sec)</label>
+          <div class="input-wrapper">
+            <i class="fa-solid fa-backward icon-left"></i>
+            <input
+              type="number"
+              id="pre-roll"
+              step="0.05"
+              min="0"
+              max="2"
+              [(ngModel)]="preRollSec"
+            />
+          </div>
+          <p class="help-text">Audio kept before each piece so its quiet attack isn't cut off.</p>
+        </div>
+
+        <div class="setting-item">
+          <label for="post-roll">Post-roll Padding (sec)</label>
+          <div class="input-wrapper">
+            <i class="fa-solid fa-forward icon-left"></i>
+            <input
+              type="number"
+              id="post-roll"
+              step="0.05"
+              min="0"
+              max="3"
+              [(ngModel)]="postRollSec"
+            />
+          </div>
+          <p class="help-text">Audio kept after each piece so its quiet decay isn't cut off.</p>
         </div>
 
         <div class="setting-item">
@@ -393,7 +447,7 @@
               <div class="track-title-container">
                 @if (editingTrackId !== track.id) {
                   <div class="title-display">
-                    <span class="track-title-text">{{ track.title }}</span>
+                    <span class="track-title-text" [title]="track.title">{{ track.title }}</span>
                     <button class="edit-title-btn" (click)="startEditing(track)" title="Rename Track">
                       <i class="fa-solid fa-pen-to-square"></i>
                     </button>
@@ -458,6 +512,30 @@
                 >
                   <i class="fa-solid fa-download"></i>
                 </button>
+
+                <!-- Track actions menu -->
+                <div class="track-menu-wrapper">
+                  <button
+                    class="btn btn-secondary btn-icon-only"
+                    (click)="toggleTrackMenu(track.id, $event)"
+                    title="Track actions"
+                  >
+                    <i class="fa-solid fa-ellipsis-vertical"></i>
+                  </button>
+                  @if (openMenuTrackId === track.id) {
+                    <div class="track-menu">
+                      <button class="track-menu-item" (click)="menuRename(track)">
+                        <i class="fa-solid fa-pen-to-square"></i> Rename
+                      </button>
+                      <button class="track-menu-item" (click)="menuDownload(track)" [disabled]="track.status !== 'done'">
+                        <i class="fa-solid fa-download"></i> Download
+                      </button>
+                      <button class="track-menu-item track-menu-danger" (click)="removeTrack(track)">
+                        <i class="fa-solid fa-trash"></i> Remove
+                      </button>
+                    </div>
+                  }
+                </div>
               </div>
             </div>
           </div>

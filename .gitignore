@@ -44,3 +44,6 @@ Thumbs.db
 .claude/settings.local.json
 
 .angular
+
+# local dev SSL cert
+.ssl

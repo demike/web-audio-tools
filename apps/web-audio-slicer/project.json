@@ -68,6 +68,14 @@
     "lint": {
       "executor": "@nx/eslint:lint"
     },
+    "test": {
+      "executor": "@angular/build:unit-test",
+      "options": {
+        "buildTarget": "web-audio-slicer:build:development",
+        "tsConfig": "apps/web-audio-slicer/tsconfig.spec.json",
+        "runner": "vitest"
+      }
+    },
     "serve-static": {
       "continuous": true,
       "executor": "@nx/web:file-server",

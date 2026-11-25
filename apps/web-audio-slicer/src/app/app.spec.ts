@@ -87,13 +87,20 @@ describe('App component', () => {
   });
 
   it('toggles the track menu and closes on document click', () => {
-    const event = { stopPropagation: vi.fn() } as unknown as Event;
-    component.toggleTrackMenu(1, event);
+    const event = {
+      stopPropagation: vi.fn(),
+      currentTarget: { getBoundingClientRect: () => ({ right: 400, bottom: 300, top: 270, left: 370 }) }
+    } as unknown as Event;
+    component.toggleTrackMenu(makeTrack(1), event);
     expect(component.openMenuTrackId).toBe(1);
+    expect(component.menuTrack?.id).toBe(1);
+    expect(component.menuPosition).not.toBeNull();
     expect(event.stopPropagation).toHaveBeenCalled();
 
     component.onDocumentClick();
     expect(component.openMenuTrackId).toBeNull();
+    expect(component.menuTrack).toBeNull();
+    expect(component.menuPosition).toBeNull();
   });
 
   it('removeTrack delegates to the service and closes the menu', () => {

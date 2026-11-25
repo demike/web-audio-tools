@@ -439,7 +439,6 @@
             class="track-card glass-panel"
             [class.card-encoding]="track.status === 'encoding'"
             [class.card-done]="track.status === 'done'"
-            [class.menu-open]="openMenuTrackId === track.id"
           >
             <div class="track-card-header">
               <span class="track-number">#{{ track.id }}</span>
@@ -514,29 +513,14 @@
                   <i class="fa-solid fa-download"></i>
                 </button>
 
-                <!-- Track actions menu -->
-                <div class="track-menu-wrapper">
-                  <button
-                    class="btn btn-secondary btn-icon-only"
-                    (click)="toggleTrackMenu(track.id, $event)"
-                    title="Track actions"
-                  >
-                    <i class="fa-solid fa-ellipsis-vertical"></i>
-                  </button>
-                  @if (openMenuTrackId === track.id) {
-                    <div class="track-menu">
-                      <button class="track-menu-item" (click)="menuRename(track)">
-                        <i class="fa-solid fa-pen-to-square"></i> Rename
-                      </button>
-                      <button class="track-menu-item" (click)="menuDownload(track)" [disabled]="track.status !== 'done'">
-                        <i class="fa-solid fa-download"></i> Download
-                      </button>
-                      <button class="track-menu-item track-menu-danger" (click)="removeTrack(track)">
-                        <i class="fa-solid fa-trash"></i> Remove
-                      </button>
-                    </div>
-                  }
-                </div>
+                <!-- Track actions menu (overlay rendered at the app root) -->
+                <button
+                  class="btn btn-secondary btn-icon-only"
+                  (click)="toggleTrackMenu(track, $event)"
+                  title="Track actions"
+                >
+                  <i class="fa-solid fa-ellipsis-vertical"></i>
+                </button>
               </div>
             </div>
           </div>
@@ -600,3 +584,21 @@
     </section>
   }
 </div>
+
+@if (menuTrack; as activeTrack) {
+  <div
+    class="track-menu track-menu-fixed"
+    [style.top.px]="menuPosition?.top"
+    [style.left.px]="menuPosition?.left"
+  >
+    <button class="track-menu-item" (click)="menuRename(activeTrack)">
+      <i class="fa-solid fa-pen-to-square"></i> Rename
+    </button>
+    <button class="track-menu-item" (click)="menuDownload(activeTrack)" [disabled]="activeTrack.status !== 'done'">
+      <i class="fa-solid fa-download"></i> Download
+    </button>
+    <button class="track-menu-item track-menu-danger" (click)="removeTrack(activeTrack)">
+      <i class="fa-solid fa-trash"></i> Remove
+    </button>
+  </div>
+}

@@ -71,6 +71,8 @@ export class App implements OnInit, OnDestroy {
   public editingTrackId: number | null = null;
   public editingTitle = '';
   public openMenuTrackId: number | null = null;
+  public menuTrack: Track | null = null;
+  public menuPosition: { top: number; left: number } | null = null;
 
   private readonly audioSlicerService = inject(AudioSlicerService);
   private readonly transcriptionService = inject(TranscriptionService);
@@ -268,19 +270,38 @@ export class App implements OnInit, OnDestroy {
   @HostListener('document:click')
   public onDocumentClick(): void {
     if (this.openMenuTrackId !== null) {
-      this.openMenuTrackId = null;
-      this.cdr.markForCheck();
+      this.closeTrackMenu();
     }
   }
 
-  public toggleTrackMenu(trackId: number, event: Event): void {
+  public toggleTrackMenu(track: Track, event: Event): void {
     event.stopPropagation();
-    this.openMenuTrackId = this.openMenuTrackId === trackId ? null : trackId;
+    if (this.openMenuTrackId === track.id) {
+      this.closeTrackMenu();
+      return;
+    }
+
+    // Render the menu as a fixed overlay at the app root so it escapes the
+    // stacking contexts created by the glass panels' backdrop-filter.
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    const menuWidth = 168;
+    const menuHeight = 132;
+    const left = Math.max(8, rect.right - menuWidth);
+    let top = rect.bottom + 6;
+    if (top + menuHeight > window.innerHeight - 8) {
+      top = Math.max(8, rect.top - menuHeight - 6);
+    }
+
+    this.menuPosition = { top, left };
+    this.menuTrack = track;
+    this.openMenuTrackId = track.id;
     this.cdr.markForCheck();
   }
 
   public closeTrackMenu(): void {
     this.openMenuTrackId = null;
+    this.menuTrack = null;
+    this.menuPosition = null;
     this.cdr.markForCheck();
   }
 

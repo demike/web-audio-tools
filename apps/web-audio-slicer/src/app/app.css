@@ -93,6 +93,7 @@
 
 /* Settings button & drawer */
 .settings-btn {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -111,6 +112,29 @@
   background: var(--color-primary);
   box-shadow: 0 0 15px var(--color-primary-glow);
   transform: translateY(-1px);
+}
+
+/* Aggregate "settings differ from defaults" badge on the header button. */
+.settings-modified-dot {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  box-shadow: 0 0 6px var(--color-accent);
+}
+
+/* Per-field "differs from default" marker. */
+.modified-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  vertical-align: middle;
 }
 
 .settings-drawer {
@@ -271,9 +295,18 @@
 
 .settings-actions {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
+  gap: 12px;
   border-top: 1px solid var(--glass-border);
   padding-top: 16px;
+}
+
+.settings-autosave-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: auto;
 }
 
 /* Dashboard Grid Layout */

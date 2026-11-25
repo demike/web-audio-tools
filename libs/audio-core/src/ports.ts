@@ -55,6 +55,7 @@ export interface SlicerObserver {
 export interface ConfigStore {
   get(key: string): string | null;
   set(key: string, value: string): void;
+  remove(key: string): void;
 }
 
 /** Timing seams so the core never touches performance/requestAnimationFrame directly. */

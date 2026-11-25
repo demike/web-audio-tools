@@ -10,6 +10,7 @@ import {
   type Track as CoreTrack
 } from '@web-audio-tools/audio-core';
 import { WorkerMp3Encoder, browserScheduler } from './browser-encoders';
+import { SettingsService } from './settings.service';
 import { TranscriptionService } from './transcription.service';
 
 export type { SilenceSegment, SlicerState, SliceOptions };
@@ -24,14 +25,6 @@ export interface Track extends CoreTrack {
   providedIn: 'root'
 })
 export class AudioSlicerService {
-  // Slicing parameters (user customizable)
-  public thresholdDb = -45;
-  public minSilenceDuration = 2.0;
-  public minSongDuration = 8.0;
-  public mp3Bitrate = 192;
-  public preRollSec = 0.3;
-  public postRollSec = 0.5;
-
   private state = new BehaviorSubject<SlicerState>({
     status: 'idle',
     fileName: '',
@@ -53,6 +46,7 @@ export class AudioSlicerService {
   public volumeLevel$ = this.volumeLevel.asObservable();
 
   private readonly transcriptionService = inject(TranscriptionService);
+  private readonly settingsService = inject(SettingsService);
   private currentFile: File | null = null;
 
   /** Persistent core slicer; its observer drives the RxJS streams the UI consumes. */
@@ -145,14 +139,7 @@ export class AudioSlicerService {
   /** Runs the core slicer over an arbitrary input (used by the UI and tools). */
   public async runInput(input: AudioInput, options: SliceOptions = {}): Promise<void> {
     this.core.transcription = options.externalTranscription ? null : this.transcriptionService;
-    this.core.parameters = {
-      thresholdDb: this.thresholdDb,
-      minSilenceDuration: this.minSilenceDuration,
-      minSongDuration: this.minSongDuration,
-      mp3Bitrate: this.mp3Bitrate,
-      preRollSec: this.preRollSec,
-      postRollSec: this.postRollSec
-    };
+    this.core.parameters = this.settingsService.slicerParameters();
 
     try {
       await this.core.run(input, options);

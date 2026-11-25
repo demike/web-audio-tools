@@ -10,6 +10,7 @@ import {
   TranscriptionService
 } from './transcription.service';
 import { WebMcpService } from './webmcp.service';
+import { SettingsService, type Settings } from './settings.service';
 import { Subscription } from 'rxjs';
 
 type ModelContextCapable = {
@@ -39,18 +40,78 @@ export class App implements OnInit, OnDestroy {
   public tracks: Track[] = [];
   public segments: SilenceSegment[] = [];
   
-  // Settings
-  public apiKey = '';
-  public transcriptionLanguage: TranscriptionLanguageCode = 'auto';
+  // Settings: the SettingsService is the single source of truth; every valid
+  // change is auto-saved. Accessors keep the template's ngModel bindings.
+  public readonly settings = inject(SettingsService);
   public transcriptionLanguageOptions = TRANSCRIPTION_LANGUAGE_OPTIONS;
-  public thresholdDb = -45;
-  public minSilenceDuration = 2.5;
-  public minSongDuration = 8.0;
-  public mp3Bitrate = 192;
-  public preRollSec = 0.3;
-  public postRollSec = 0.5;
-  public transcribeSpeechGapsOnStart = true;
+  // Run option (per-run input, not a Setting): not persisted, not reset.
   public trackStartIndex = 1;
+
+  public get apiKey(): string {
+    return this.settings.apiKey();
+  }
+  public set apiKey(value: string) {
+    this.settings.setApiKey(value);
+  }
+
+  public get transcriptionLanguage(): TranscriptionLanguageCode {
+    return this.settings.settings().transcriptionLanguage;
+  }
+  public set transcriptionLanguage(value: TranscriptionLanguageCode) {
+    this.settings.update({ transcriptionLanguage: value });
+    if (typeof window !== 'undefined') {
+      void this.transcriptionService.refreshPromptApiDiagnostics();
+    }
+  }
+
+  public get thresholdDb(): number {
+    return this.settings.settings().thresholdDb;
+  }
+  public set thresholdDb(value: number) {
+    this.settings.update({ thresholdDb: value });
+  }
+
+  public get minSilenceDuration(): number {
+    return this.settings.settings().minSilenceDuration;
+  }
+  public set minSilenceDuration(value: number) {
+    this.settings.update({ minSilenceDuration: value });
+  }
+
+  public get minSongDuration(): number {
+    return this.settings.settings().minSongDuration;
+  }
+  public set minSongDuration(value: number) {
+    this.settings.update({ minSongDuration: value });
+  }
+
+  public get mp3Bitrate(): number {
+    return this.settings.settings().mp3Bitrate;
+  }
+  public set mp3Bitrate(value: number) {
+    this.settings.update({ mp3Bitrate: value });
+  }
+
+  public get preRollSec(): number {
+    return this.settings.settings().preRollSec;
+  }
+  public set preRollSec(value: number) {
+    this.settings.update({ preRollSec: value });
+  }
+
+  public get postRollSec(): number {
+    return this.settings.settings().postRollSec;
+  }
+  public set postRollSec(value: number) {
+    this.settings.update({ postRollSec: value });
+  }
+
+  public get transcribeSpeechGapsOnStart(): boolean {
+    return this.settings.settings().transcribeSpeechGapsOnStart;
+  }
+  public set transcribeSpeechGapsOnStart(value: boolean) {
+    this.settings.update({ transcribeSpeechGapsOnStart: value });
+  }
 
   // UI status
   public promptApiDiagnostics: PromptApiDiagnostics = {
@@ -81,17 +142,7 @@ export class App implements OnInit, OnDestroy {
   private subs: Subscription[] = [];
 
   public async ngOnInit(): Promise<void> {
-    // 1. Load settings from localStorage
-    this.apiKey = this.transcriptionService.getApiKey();
-    this.transcriptionLanguage = this.transcriptionService.getTranscriptionLanguage();
-    this.thresholdDb = this.audioSlicerService.thresholdDb;
-    this.minSilenceDuration = this.audioSlicerService.minSilenceDuration;
-    this.minSongDuration = this.audioSlicerService.minSongDuration;
-    this.mp3Bitrate = this.audioSlicerService.mp3Bitrate;
-    this.preRollSec = this.audioSlicerService.preRollSec;
-    this.postRollSec = this.audioSlicerService.postRollSec;
-
-    // 2. Subscriptions
+    // 1. Subscriptions
     this.subs.push(
       this.audioSlicerService.state$.subscribe(s => {
         this.state = s;
@@ -117,7 +168,7 @@ export class App implements OnInit, OnDestroy {
       })
     );
 
-    // 3. AI Support detection and WebMCP registration (Browser-only)
+    // 2. AI Support detection and WebMCP registration (Browser-only)
     if (typeof window !== 'undefined') {
       await this.transcriptionService.refreshPromptApiDiagnostics();
 
@@ -138,18 +189,41 @@ export class App implements OnInit, OnDestroy {
   }
 
   // --- Settings Management ---
-  public saveSettings(): void {
-    this.transcriptionService.saveApiKey(this.apiKey);
-    this.transcriptionService.saveTranscriptionLanguage(this.transcriptionLanguage);
-    this.audioSlicerService.thresholdDb = Number(this.thresholdDb);
-    this.audioSlicerService.minSilenceDuration = Number(this.minSilenceDuration);
-    this.audioSlicerService.minSongDuration = Number(this.minSongDuration);
-    this.audioSlicerService.mp3Bitrate = Number(this.mp3Bitrate);
-    this.audioSlicerService.preRollSec = Number(this.preRollSec);
-    this.audioSlicerService.postRollSec = Number(this.postRollSec);
+  public resetConfirmPending = false;
+
+  public toggleSettings(): void {
+    this.showSettings = !this.showSettings;
+    if (!this.showSettings) {
+      this.resetConfirmPending = false;
+    }
+  }
+
+  public closeSettings(): void {
     this.showSettings = false;
-    if (typeof window !== 'undefined') {
-      void this.transcriptionService.refreshPromptApiDiagnostics();
+    this.resetConfirmPending = false;
+  }
+
+  /** Two-step confirmation: the first click arms the reset, the second performs it. */
+  public requestResetToDefaults(): void {
+    if (!this.settings.anyModified()) return;
+    if (!this.resetConfirmPending) {
+      this.resetConfirmPending = true;
+      return;
+    }
+    this.settings.resetToDefaults();
+    this.resetConfirmPending = false;
+  }
+
+  public cancelResetToDefaults(): void {
+    this.resetConfirmPending = false;
+  }
+
+  /** On blur, snap an invalid mid-edit input back to the last valid persisted value. */
+  public revertInvalidInput(field: keyof Settings, event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const value = String(this.settings.settings()[field]);
+    if (input.value !== value) {
+      input.value = value;
     }
   }
 
@@ -230,9 +304,6 @@ export class App implements OnInit, OnDestroy {
   // --- Slicing Controls ---
   public async startSlicing(): Promise<void> {
     if (!this.file) return;
-    
-    // Save current parameters to the service just in case
-    this.saveSettings();
 
     try {
       await this.audioSlicerService.sliceWavFile(this.file, {

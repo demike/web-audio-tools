@@ -1,4 +1,4 @@
-import { Injectable } from '@angular/core';
+import { Injectable, inject } from '@angular/core';
 import { BehaviorSubject } from 'rxjs';
 import {
   GeminiModel,
@@ -11,6 +11,7 @@ import {
   type TranscriptionLanguageCode,
   type TranscriptionPort
 } from '@web-audio-tools/audio-core';
+import { SettingsService } from './settings.service';
 
 export type { TranscriptionLanguageCode, SongTitleExtractionResult };
 export { TRANSCRIPTION_LANGUAGE_OPTIONS };
@@ -53,8 +54,7 @@ type PromptApiGlobal = typeof globalThis & {
   providedIn: 'root'
 })
 export class TranscriptionService implements TranscriptionPort {
-  private apiKeyKey = 'web_audio_slicer_gemini_key';
-  private transcriptionLanguageKey = 'web_audio_slicer_transcription_language';
+  private readonly settingsService = inject(SettingsService);
   private promptApiDiagnostics = new BehaviorSubject<PromptApiDiagnostics>(
     this.buildPromptApiDiagnostics('unsupported')
   );
@@ -73,33 +73,12 @@ export class TranscriptionService implements TranscriptionPort {
     getLanguage: () => this.getTranscriptionLanguage()
   });
 
-  public saveApiKey(key: string): void {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(this.apiKeyKey, key);
-    }
-  }
-
   public getApiKey(): string {
-    if (typeof localStorage !== 'undefined') {
-      return localStorage.getItem(this.apiKeyKey) || '';
-    }
-    return '';
-  }
-
-  public saveTranscriptionLanguage(language: TranscriptionLanguageCode): void {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(this.transcriptionLanguageKey, language);
-    }
+    return this.settingsService.apiKey();
   }
 
   public getTranscriptionLanguage(): TranscriptionLanguageCode {
-    if (typeof localStorage === 'undefined') {
-      return 'auto';
-    }
-    const stored = localStorage.getItem(this.transcriptionLanguageKey);
-    return TRANSCRIPTION_LANGUAGE_OPTIONS.some(option => option.value === stored)
-      ? (stored as TranscriptionLanguageCode)
-      : 'auto';
+    return this.settingsService.settings().transcriptionLanguage;
   }
 
   public getPromptApiDiagnosticsValue(): PromptApiDiagnostics {

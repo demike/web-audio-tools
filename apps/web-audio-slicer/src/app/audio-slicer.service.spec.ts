@@ -1,8 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TestBed } from '@angular/core/testing';
-import { createWavBytes } from '@web-audio-tools/audio-core';
+import { createWavBytes, type ConfigStore } from '@web-audio-tools/audio-core';
 import { AudioSlicerService } from './audio-slicer.service';
+import { CONFIG_STORE } from './config-store';
+import { SettingsService } from './settings.service';
 import { TranscriptionService } from './transcription.service';
+
+class MemoryConfigStore implements ConfigStore {
+  public readonly data = new Map<string, string>();
+  public get(key: string): string | null {
+    return this.data.get(key) ?? null;
+  }
+  public set(key: string, value: string): void {
+    this.data.set(key, value);
+  }
+  public remove(key: string): void {
+    this.data.delete(key);
+  }
+}
 
 class FakeWorker {
   public onmessage: ((event: { data: unknown }) => void) | null = null;
@@ -59,6 +74,7 @@ async function* chunks(bytes: Uint8Array): AsyncGenerator<Uint8Array> {
 }
 
 let service: AudioSlicerService;
+let settings: SettingsService;
 
 beforeEach(() => {
   vi.stubGlobal('Worker', FakeWorker);
@@ -71,10 +87,12 @@ beforeEach(() => {
   TestBed.configureTestingModule({
     providers: [
       AudioSlicerService,
+      { provide: CONFIG_STORE, useValue: new MemoryConfigStore() },
       { provide: TranscriptionService, useValue: transcriptionMock }
     ]
   });
   service = TestBed.inject(AudioSlicerService);
+  settings = TestBed.inject(SettingsService);
 });
 
 afterEach(() => {
@@ -118,6 +136,16 @@ describe('AudioSlicerService', () => {
     expect(service.getTracksValue()).toHaveLength(1);
     expect(service.getTracksValue()[0].id).toBe(2);
     expect(revokeSpy).toHaveBeenCalledWith(url);
+  });
+
+  it('runs with the current Settings from the SettingsService', async () => {
+    // Pieces are 10s; raising the minimum song duration above that filters
+    // the first piece out, proving settings flow into the engine at run time.
+    // (The core always keeps the unfinished tail piece at EOF.)
+    settings.update({ minSongDuration: 60 });
+    const bytes = twoPieceWav();
+    await service.runInput(chunks(bytes), { fileSizeBytes: bytes.length });
+    expect(service.getTracksValue()).toHaveLength(1);
   });
 
   it('reset clears tracks and segments', async () => {

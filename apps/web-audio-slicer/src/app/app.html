@@ -30,9 +30,12 @@
         <span>WebMCP: {{ webMcpStatus === 'active' ? 'Active' : 'Not Loaded' }}</span>
       </div>
       
-      <button class="settings-btn" (click)="showSettings = !showSettings" title="Adjust Slicer Settings & API Keys">
+      <button class="settings-btn" (click)="toggleSettings()" title="Adjust Slicer Settings & API Keys">
         <i class="fa-solid fa-sliders"></i>
         <span>Settings</span>
+        @if (settings.anyModified()) {
+          <span class="settings-modified-dot" title="Settings differ from defaults"></span>
+        }
       </button>
     </div>
   </header>
@@ -42,7 +45,7 @@
     <div class="settings-drawer glass-panel">
       <div class="settings-header">
         <h3><i class="fa-solid fa-gears text-purple"></i> Slicer & API Configuration</h3>
-        <button class="close-btn" (click)="showSettings = false"><i class="fa-solid fa-xmark"></i></button>
+        <button class="close-btn" (click)="closeSettings()"><i class="fa-solid fa-xmark"></i></button>
       </div>
       
       <div class="settings-grid">
@@ -118,7 +121,12 @@
         </div>
 
         <div class="setting-item">
-          <label for="transcription-language">Transcription Language</label>
+          <label for="transcription-language">
+            Transcription Language
+            @if (settings.modified().transcriptionLanguage) {
+              <span class="modified-dot" title="Differs from default"></span>
+            }
+          </label>
           <div class="input-wrapper">
             <i class="fa-solid fa-language icon-left"></i>
             <select id="transcription-language" [(ngModel)]="transcriptionLanguage">
@@ -133,7 +141,12 @@
         </div>
 
         <div class="setting-item">
-          <label for="threshold">Silence Threshold (dB)</label>
+          <label for="threshold">
+            Silence Threshold (dB)
+            @if (settings.modified().thresholdDb) {
+              <span class="modified-dot" title="Differs from default"></span>
+            }
+          </label>
           <div class="input-wrapper-range">
             <input 
               type="range" 
@@ -149,7 +162,12 @@
         </div>
 
         <div class="setting-item">
-          <label for="silence-dur">Min Silence Split (sec)</label>
+          <label for="silence-dur">
+            Min Silence Split (sec)
+            @if (settings.modified().minSilenceDuration) {
+              <span class="modified-dot" title="Differs from default"></span>
+            }
+          </label>
           <div class="input-wrapper">
             <i class="fa-solid fa-hourglass-half icon-left"></i>
             <input 
@@ -159,13 +177,19 @@
               min="0.5" 
               max="10.0" 
               [(ngModel)]="minSilenceDuration" 
+              (blur)="revertInvalidInput('minSilenceDuration', $event)"
             />
           </div>
           <p class="help-text">Gaps must be at least this long to separate tracks.</p>
         </div>
 
         <div class="setting-item">
-          <label for="song-dur">Min Song Duration (sec)</label>
+          <label for="song-dur">
+            Min Song Duration (sec)
+            @if (settings.modified().minSongDuration) {
+              <span class="modified-dot" title="Differs from default"></span>
+            }
+          </label>
           <div class="input-wrapper">
             <i class="fa-solid fa-music icon-left"></i>
             <input 
@@ -175,13 +199,19 @@
               min="2" 
               max="60" 
               [(ngModel)]="minSongDuration" 
+              (blur)="revertInvalidInput('minSongDuration', $event)"
             />
           </div>
           <p class="help-text">Slices shorter than this will be ignored (e.g. noise).</p>
         </div>
 
         <div class="setting-item">
-          <label for="pre-roll">Pre-roll Padding (sec)</label>
+          <label for="pre-roll">
+            Pre-roll Padding (sec)
+            @if (settings.modified().preRollSec) {
+              <span class="modified-dot" title="Differs from default"></span>
+            }
+          </label>
           <div class="input-wrapper">
             <i class="fa-solid fa-backward icon-left"></i>
             <input
@@ -191,13 +221,19 @@
               min="0"
               max="2"
               [(ngModel)]="preRollSec"
+              (blur)="revertInvalidInput('preRollSec', $event)"
             />
           </div>
           <p class="help-text">Audio kept before each piece so its quiet attack isn't cut off.</p>
         </div>
 
         <div class="setting-item">
-          <label for="post-roll">Post-roll Padding (sec)</label>
+          <label for="post-roll">
+            Post-roll Padding (sec)
+            @if (settings.modified().postRollSec) {
+              <span class="modified-dot" title="Differs from default"></span>
+            }
+          </label>
           <div class="input-wrapper">
             <i class="fa-solid fa-forward icon-left"></i>
             <input
@@ -207,20 +243,26 @@
               min="0"
               max="3"
               [(ngModel)]="postRollSec"
+              (blur)="revertInvalidInput('postRollSec', $event)"
             />
           </div>
           <p class="help-text">Audio kept after each piece so its quiet decay isn't cut off.</p>
         </div>
 
         <div class="setting-item">
-          <label for="bitrate">MP3 Export Quality (bitrate)</label>
+          <label for="bitrate">
+            MP3 Export Quality (bitrate)
+            @if (settings.modified().mp3Bitrate) {
+              <span class="modified-dot" title="Differs from default"></span>
+            }
+          </label>
           <div class="input-wrapper">
             <i class="fa-solid fa-waveform icon-left"></i>
             <select id="bitrate" [(ngModel)]="mp3Bitrate">
-              <option [value]="96">96 kbps (Standard Mono)</option>
-              <option [value]="128">128 kbps (Medium Stereo)</option>
-              <option [value]="192">192 kbps (High Quality Stereo)</option>
-              <option [value]="320">320 kbps (Max Quality Stereo)</option>
+              <option [ngValue]="96">96 kbps (Standard Mono)</option>
+              <option [ngValue]="128">128 kbps (Medium Stereo)</option>
+              <option [ngValue]="192">192 kbps (High Quality Stereo)</option>
+              <option [ngValue]="320">320 kbps (Max Quality Stereo)</option>
             </select>
           </div>
           <p class="help-text">Output audio file compression density.</p>
@@ -228,8 +270,24 @@
       </div>
       
       <div class="settings-actions">
-        <button class="btn btn-primary" (click)="saveSettings()">
-          <i class="fa-solid fa-check"></i> Save Parameters
+        <p class="help-text settings-autosave-hint">
+          <i class="fa-solid fa-circle-check"></i> Changes are saved automatically as you make them.
+        </p>
+        @if (resetConfirmPending) {
+          <button class="btn btn-secondary" (click)="cancelResetToDefaults()">
+            <i class="fa-solid fa-xmark"></i> Cancel
+          </button>
+        }
+        <button
+          class="btn"
+          [class.btn-danger]="resetConfirmPending"
+          [class.btn-secondary]="!resetConfirmPending"
+          [disabled]="!settings.anyModified()"
+          (click)="requestResetToDefaults()"
+          title="Restore every setting to its default (the API key is kept)"
+        >
+          <i class="fa-solid fa-rotate-left"></i>
+          {{ resetConfirmPending ? 'Confirm reset?' : 'Reset to defaults' }}
         </button>
       </div>
     </div>
@@ -300,7 +358,12 @@
                   type="checkbox"
                   [(ngModel)]="transcribeSpeechGapsOnStart"
                 />
-                <span>Transcribe spoken announcements for automatic track naming</span>
+                <span>
+                  Transcribe spoken announcements for automatic track naming
+                  @if (settings.modified().transcribeSpeechGapsOnStart) {
+                    <span class="modified-dot" title="Differs from default"></span>
+                  }
+                </span>
               </label>
 
               <p class="help-text analysis-option-help">

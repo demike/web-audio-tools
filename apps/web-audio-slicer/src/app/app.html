@@ -439,6 +439,7 @@
             class="track-card glass-panel"
             [class.card-encoding]="track.status === 'encoding'"
             [class.card-done]="track.status === 'done'"
+            [class.menu-open]="openMenuTrackId === track.id"
           >
             <div class="track-card-header">
               <span class="track-number">#{{ track.id }}</span>

@@ -799,6 +799,12 @@
   position: relative;
 }
 
+/* Glass panels create a stacking context (backdrop-filter), so the dropdown
+   can't escape its own card. Raise the whole card while its menu is open. */
+.track-card.menu-open {
+  z-index: 60;
+}
+
 .card-encoding {
   border-color: rgba(139, 92, 246, 0.2);
   background: rgba(139, 92, 246, 0.02);

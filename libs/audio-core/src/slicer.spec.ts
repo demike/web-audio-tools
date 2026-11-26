@@ -1,11 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { Slicer } from './slicer';
-import { LameMp3Encoder } from './mp3';
 import type { TranscriptionPort } from './ports';
 import { concat, fade, silence, tone, wavBytes } from './test-helpers';
 
 function makeSlicer(transcription: TranscriptionPort | null = null): Slicer {
-  return new Slicer({ encoderFactory: () => new LameMp3Encoder(), transcription });
+  return new Slicer({ transcription });
 }
 
 async function waitFor(condition: () => boolean, timeoutMs = 15000): Promise<void> {
@@ -19,7 +18,7 @@ async function waitFor(condition: () => boolean, timeoutMs = 15000): Promise<voi
 }
 
 describe('Slicer region detection', () => {
-  it('slices two pieces separated by silence and encodes both', async () => {
+  it('detects two pieces separated by silence (detection only, no encoding)', async () => {
     const signal = concat(silence(2), tone(10, 0.5), silence(3), tone(10, 0.5), silence(2));
     const bytes = wavBytes([signal, signal]);
     const slicer = makeSlicer();
@@ -27,9 +26,9 @@ describe('Slicer region detection', () => {
 
     expect(result.tracks).toHaveLength(2);
     for (const track of result.tracks) {
-      expect(track.status).toBe('done');
-      expect(track.mp3Bytes!.length).toBeGreaterThan(0);
-      expect(track.mp3Bytes![0]).toBe(0xff);
+      expect(track.status).toBe('pending');
+      expect(track.mp3Bytes).toBeNull();
+      expect(track.duration).toBeGreaterThan(8);
     }
   });
 

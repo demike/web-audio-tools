@@ -2,17 +2,33 @@ import { describe, expect, it } from 'vitest';
 import { createSlicerTools, type ToolDefinition } from './tools';
 import { Slicer } from './slicer';
 import { LameMp3Encoder } from './mp3';
+import { DRY_EFFECT_CONFIG } from './effects';
+import { createRegionSource } from './region';
+import { exportRegionToMp3 } from './processing';
+import { createRecordingInput } from './recording';
 import { concat, silence, tone, wavBytes } from './test-helpers';
 
 function buildTools() {
   const signal = concat(silence(1), tone(2, 0.005, 300), silence(1), tone(10, 0.5), silence(3), tone(10, 0.5), silence(2));
   const bytes = wavBytes([signal, signal]);
-  const slicer = new Slicer({ encoderFactory: () => new LameMp3Encoder(), transcription: null });
+  const slicer = new Slicer({ transcription: null });
+  const chunk = { name: 'rehearsal.wav', sizeBytes: bytes.length, open: () => chunks(bytes) };
 
   const tools = createSlicerTools({
     slicer,
     resolveInput: async () => chunks(bytes),
-    fileSize: async () => bytes.length
+    fileSize: async () => bytes.length,
+    exportTrack: async track => {
+      const recording = await createRecordingInput([chunk]);
+      for await (const _ of recording.input) { void _; }
+      const source = createRegionSource([chunk], recording, track.startTime, track.endTime);
+      return exportRegionToMp3(
+        source,
+        { config: DRY_EFFECT_CONFIG, sampleRate: recording.header.sampleRate, sourceChannels: recording.header.channels },
+        () => new LameMp3Encoder(),
+        192
+      );
+    }
   });
   const byName = new Map<string, ToolDefinition>(tools.map(t => [t.name, t]));
 

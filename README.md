@@ -17,6 +17,10 @@ browser Angular app, a Node/Bun CLI, and a portable tool layer.
 ## What it does
 
 - Streams WAV input and parses PCM incrementally instead of loading the whole file into memory.
+- Processes split recordings as one continuous Recording: multiple WAV chunks
+  (e.g. a Zoom recorder's 2 GB splits in separate date/time folders) are joined
+  into a single timeline, so a piece spanning a split stays one track. A single
+  file is just a one-chunk Recording — the same flow, no extra steps.
 - Detects piece regions by watching dB level transitions between `SILENCE` and `SONG` windows.
 - Encodes each detected piece to MP3 (Web Worker in the browser, lamejs directly in Node/Bun).
 - Transcribes spoken announcements (someone naming the piece before it is played) and uses that text to name the next MP3 file.
@@ -49,10 +53,16 @@ bun apps/audio-cli/src/main.ts rehearsal.wav --out ./tracks
 # Or build once and run with Node
 npx nx build audio-cli
 node dist/apps/audio-cli/main.js rehearsal.wav --out ./tracks
+
+# Split recordings: list the chunks in order, or point at directories.
+# Here a Zoom card's date/time folders each hold a mic file and a mix;
+# --match keeps only the mic files (TRASH/Export are always skipped).
+node dist/apps/audio-cli/main.js /path/to/card --match '*_TrMic.WAV' --out ./tracks
 ```
 
-Writes each piece as `<title>.mp3` plus a `manifest.json` of tracks, timings, and
-transcriptions. Options: `--threshold`, `--min-silence`, `--min-song`, `--bitrate`,
+Writes each piece as `<title>.mp3` plus a `manifest.json` of tracks, timings,
+transcriptions, and the Recording's chunks (file names, sizes, start times).
+Options: `--match`, `--threshold`, `--min-silence`, `--min-song`, `--bitrate`,
 `--lang`, `--start-index`, `--no-transcribe`, `--gemini-key` (or `GEMINI_API_KEY`).
 
 ## Why not ffmpeg.wasm
@@ -62,5 +72,8 @@ transcriptions. Options: `--threshold`, `--min-silence`, `--min-song`, `--bitrat
 ## Browser notes
 
 - Large WAV files are processed incrementally, but quiet gaps still need to be buffered temporarily for transcription.
+- Multi-select, multi-file drop, and folder drop load a multi-chunk Recording; an
+  optional folder filter (e.g. `TrMic`) picks one file per folder. Chunks sort
+  naturally by file name and can be reordered before slicing.
 - Prompt API audio support depends on the local Chrome build and device capabilities.
 - WebMCP registration is optional and activates only when the browser exposes a model context API.

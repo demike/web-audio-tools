@@ -1,7 +1,10 @@
 import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef, HostListener, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { compareNaturally, type EffectChainConfig, type Preset } from '@web-audio-tools/audio-core';
 import { AudioSlicerService, Track, SilenceSegment, SlicerState } from './audio-slicer.service';
+import { PresetService } from './preset.service';
+import { AuditionService } from './audition.service';
 import {
   PromptApiDiagnostics,
   PromptApiStatus,
@@ -17,6 +20,13 @@ type ModelContextCapable = {
   modelContext?: unknown;
 };
 
+/** Card directories that never hold source recordings (Zoom TRASH/Export). */
+const SKIPPED_FOLDERS = new Set(['trash', 'export']);
+
+function isWavName(name: string): boolean {
+  return name.toLowerCase().endsWith('.wav');
+}
+
 @Component({
   selector: 'app-root',
   imports: [CommonModule, FormsModule],
@@ -25,7 +35,12 @@ type ModelContextCapable = {
   styleUrl: './app.css'
 })
 export class App implements OnInit, OnDestroy {
-  public file: File | null = null;
+  /** The loaded Recording: one or more WAV chunks, in playback order. */
+  public files: File[] = [];
+  /** Run option: substring filter applied to files discovered inside dropped folders. */
+  public fileNameFilter = '';
+  /** "Chunk i of n" while slicing a multi-chunk Recording. */
+  public chunkLabel = '';
   public state: SlicerState = {
     status: 'idle',
     fileName: '',
@@ -43,6 +58,10 @@ export class App implements OnInit, OnDestroy {
   // Settings: the SettingsService is the single source of truth; every valid
   // change is auto-saved. Accessors keep the template's ngModel bindings.
   public readonly settings = inject(SettingsService);
+  public readonly presets = inject(PresetService);
+  public readonly audition = inject(AuditionService);
+  public exportingAll = false;
+  public exportError: string | null = null;
   public transcriptionLanguageOptions = TRANSCRIPTION_LANGUAGE_OPTIONS;
   // Run option (per-run input, not a Setting): not persisted, not reset.
   public trackStartIndex = 1;
@@ -165,6 +184,10 @@ export class App implements OnInit, OnDestroy {
         this.volumeHistory.shift();
         this.volumeHistory.push(db);
         this.cdr.markForCheck();
+      }),
+      this.audioSlicerService.chunkLabel$.subscribe(label => {
+        this.chunkLabel = label;
+        this.cdr.markForCheck();
       })
     );
 
@@ -273,8 +296,10 @@ export class App implements OnInit, OnDestroy {
   public onFileSelected(event: Event): void {
     const input = event.target as HTMLInputElement;
     if (input.files && input.files.length > 0) {
-      this.file = input.files[0];
-      this.audioSlicerService.reset();
+      const wavFiles = Array.from(input.files).filter(file => isWavName(file.name));
+      if (wavFiles.length > 0) {
+        this.setFiles(wavFiles);
+      }
     }
   }
 
@@ -287,26 +312,102 @@ export class App implements OnInit, OnDestroy {
     this.isDragOver = false;
   }
 
-  public onDrop(event: DragEvent): void {
+  public async onDrop(event: DragEvent): Promise<void> {
     event.preventDefault();
     this.isDragOver = false;
-    if (event.dataTransfer && event.dataTransfer.files.length > 0) {
-      const droppedFile = event.dataTransfer.files[0];
-      if (droppedFile.name.toLowerCase().endsWith('.wav')) {
-        this.file = droppedFile;
-        this.audioSlicerService.reset();
-      } else {
-        alert('Please select a valid WAV audio file.');
+    const transfer = event.dataTransfer;
+    if (!transfer) {
+      return;
+    }
+
+    // Capture entries and files synchronously: DataTransfer items are
+    // invalidated once the handler yields.
+    const items = Array.from(transfer.items ?? []);
+    const entries = items.map(item => typeof item.webkitGetAsEntry === 'function' ? item.webkitGetAsEntry() : null);
+    const plainFiles = Array.from(transfer.files);
+
+    const collected: File[] = [];
+    if (entries.some(entry => entry !== null)) {
+      for (const entry of entries) {
+        if (entry) {
+          await this.collectEntry(entry, collected, false);
+        }
+      }
+    } else {
+      collected.push(...plainFiles);
+    }
+
+    const wavFiles = collected.filter(file => isWavName(file.name));
+    if (wavFiles.length === 0) {
+      alert('Please select a valid WAV audio file.');
+      return;
+    }
+    this.setFiles(wavFiles);
+  }
+
+  /**
+   * Walks a dropped filesystem entry. Loose files are kept as given; files
+   * discovered inside folders pass the folder filter. TRASH/Export are skipped.
+   */
+  private async collectEntry(entry: FileSystemEntry, out: File[], inFolder: boolean): Promise<void> {
+    if (entry.isFile) {
+      if (inFolder && !this.matchesFolderFilter(entry.name)) {
+        return;
+      }
+      const file = await new Promise<File>((resolve, reject) => (entry as FileSystemFileEntry).file(resolve, reject));
+      out.push(file);
+    } else if (entry.isDirectory) {
+      if (SKIPPED_FOLDERS.has(entry.name.toLowerCase())) {
+        return;
+      }
+      const reader = (entry as FileSystemDirectoryEntry).createReader();
+      // readEntries returns at most 100 entries per call; loop until empty.
+      for (;;) {
+        const batch = await new Promise<FileSystemEntry[]>((resolve, reject) => reader.readEntries(resolve, reject));
+        if (batch.length === 0) {
+          break;
+        }
+        for (const child of batch) {
+          await this.collectEntry(child, out, true);
+        }
       }
     }
   }
 
+  private matchesFolderFilter(name: string): boolean {
+    const filter = this.fileNameFilter.trim().toLowerCase();
+    return filter === '' || name.toLowerCase().includes(filter);
+  }
+
+  /** A new load replaces the Recording; chunks sort naturally by file name. */
+  private setFiles(files: File[]): void {
+    this.files = [...files].sort((a, b) => compareNaturally(a.name, b.name));
+    this.audioSlicerService.reset();
+    this.cdr.markForCheck();
+  }
+
+  /** Fixes the playback order when file names don't sort chronologically. */
+  public moveChunk(index: number, delta: number): void {
+    const target = index + delta;
+    if (target < 0 || target >= this.files.length) {
+      return;
+    }
+    const files = [...this.files];
+    [files[index], files[target]] = [files[target], files[index]];
+    this.files = files;
+    this.cdr.markForCheck();
+  }
+
+  public get totalSizeBytes(): number {
+    return this.files.reduce((sum, file) => sum + file.size, 0);
+  }
+
   // --- Slicing Controls ---
   public async startSlicing(): Promise<void> {
-    if (!this.file) return;
+    if (this.files.length === 0) return;
 
     try {
-      await this.audioSlicerService.sliceWavFile(this.file, {
+      await this.audioSlicerService.sliceRecording(this.files, {
         transcribeSpeechGaps: this.transcribeSpeechGapsOnStart,
         trackStartIndex: this.trackStartIndex
       });
@@ -402,30 +503,127 @@ export class App implements OnInit, OnDestroy {
     });
   }
 
-  // --- Download Helpers ---
-  public downloadTrack(track: Track): void {
-    if (!track.mp3Url || !track.mp3Blob) return;
-    
+  // --- Effects, Presets & Audition ---
+  public selectPreset(name: string): void {
+    this.presets.select(name === '' ? null : name);
+    this.audition.configChanged();
+    this.cdr.markForCheck();
+  }
+
+  public updateEffect<K extends keyof EffectChainConfig>(kind: K, patch: Partial<EffectChainConfig[K]>): void {
+    this.presets.updateSection(kind, patch);
+    this.audition.configChanged();
+    this.cdr.markForCheck();
+  }
+
+  public toggleEffect(kind: keyof EffectChainConfig): void {
+    const current = this.presets.workingConfig()[kind];
+    this.updateEffect(kind, { enabled: !current.enabled } as Partial<EffectChainConfig[typeof kind]>);
+  }
+
+  public savePreset(): void {
+    const name = prompt('Save Preset as:', this.presets.selectedName() ?? 'My Preset');
+    if (name && name.trim()) {
+      this.presets.saveAsNew(name.trim());
+      this.cdr.markForCheck();
+    }
+  }
+
+  public deletePreset(name: string): void {
+    this.presets.deleteUserPreset(name);
+    this.cdr.markForCheck();
+  }
+
+  public async importPreset(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) {
+      return;
+    }
+    const preset = this.presets.importFromJson(await file.text());
+    if (!preset) {
+      alert('That file is not a valid Preset JSON document.');
+    }
+    input.value = '';
+    this.cdr.markForCheck();
+  }
+
+  public exportPresetFile(preset: Preset): void {
+    const blob = new Blob([this.presets.exportJson(preset)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
     const element = document.createElement('a');
-    element.href = track.mp3Url;
-    // Sanitize filename
-    const safeTitle = track.title.replace(/[^a-zA-Z0-9_\-\s]/g, '');
+    element.href = url;
+    element.download = `${preset.name.replace(/[^a-zA-Z0-9_\-\s]/g, '') || 'preset'}.json`;
+    element.click();
+    URL.revokeObjectURL(url);
+  }
+
+  public auditionTrack(track: Track): void {
+    this.audition.audition(track.key);
+    this.cdr.markForCheck();
+  }
+
+  public stopAudition(): void {
+    this.audition.stop();
+    this.cdr.markForCheck();
+  }
+
+  public toggleDryWet(): void {
+    this.audition.toggleDryWet();
+    this.cdr.markForCheck();
+  }
+
+  // --- Download / Export Helpers ---
+  /** Downloads a Track, exporting it first if it hasn't been processed yet. */
+  public async downloadTrack(track: Track): Promise<void> {
+    this.exportError = null;
+    if (track.status !== 'done' || !track.mp3Url) {
+      try {
+        await this.audioSlicerService.exportTrack(track.key, this.presets.workingConfig());
+      } catch (error) {
+        this.exportError = (error as Error).message;
+        this.cdr.markForCheck();
+        return;
+      }
+    }
+    const fresh = this.audioSlicerService.getTracksValue().find(t => t.key === track.key);
+    if (!fresh?.mp3Url || !fresh.mp3Blob) {
+      return;
+    }
+    const element = document.createElement('a');
+    element.href = fresh.mp3Url;
+    const safeTitle = fresh.title.replace(/[^a-zA-Z0-9_\-\s]/g, '');
     element.download = `${safeTitle || 'Track'}.mp3`;
     document.body.appendChild(element);
     element.click();
     document.body.removeChild(element);
+    this.cdr.markForCheck();
+  }
+
+  /** Exports every Track with the working config, then downloads them. */
+  public async exportAndDownloadAll(): Promise<void> {
+    if (this.tracks.length === 0 || this.exportingAll) {
+      return;
+    }
+    this.exportingAll = true;
+    this.exportError = null;
+    this.cdr.markForCheck();
+    try {
+      await this.audioSlicerService.exportAll(this.presets.workingConfig());
+      const done = this.audioSlicerService.getTracksValue().filter(t => t.status === 'done');
+      done.forEach((track, index) => {
+        setTimeout(() => this.downloadTrack(track), index * 400);
+      });
+    } catch (error) {
+      this.exportError = (error as Error).message;
+    } finally {
+      this.exportingAll = false;
+      this.cdr.markForCheck();
+    }
   }
 
   public downloadAll(): void {
-    const completedTracks = this.tracks.filter(t => t.status === 'done');
-    if (completedTracks.length === 0) return;
-
-    // Sequentially download each track
-    completedTracks.forEach((track, index) => {
-      setTimeout(() => {
-        this.downloadTrack(track);
-      }, index * 400); // Small timeout to prevent browser blocking multiple downloads
-    });
+    void this.exportAndDownloadAll();
   }
 
   // --- Formatting Helpers ---

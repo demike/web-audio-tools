@@ -12,21 +12,34 @@ export interface WavHeader {
 }
 
 /**
- * Parses a WAV file header from an ArrayBuffer.
+ * Upper bound on how many leading bytes are scanned for the RIFF/RF64 header.
+ * Recorders (e.g. Zoom) embed BEXT/iXML metadata chunks before `data`, so the
+ * header can be well past the canonical 44 bytes. RF64 (2 GB splits) adds a
+ * ds64 chunk. 1 MiB comfortably covers real-world metadata while still bounding
+ * the scan for a file that is not a WAV at all.
+ */
+export const MAX_WAV_HEADER_BYTES = 1024 * 1024;
+
+const WAVE_FORMAT_EXTENSIBLE = 0xfffe;
+
+/**
+ * Parses a WAV file header from an ArrayBuffer. Handles canonical RIFF PCM,
+ * RF64 (Zoom 2 GB splits: `RF64` magic + a `ds64` chunk carrying the real data
+ * size), and WAVE_FORMAT_EXTENSIBLE (format code lives in the SubFormat GUID).
  */
 export function parseWavHeader(buffer: ArrayBuffer): WavHeader | null {
   const view = new DataView(buffer);
-  
+
   if (view.byteLength < 44) return null;
-  
-  // Check "RIFF"
-  const riff = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
-  if (riff !== 'RIFF') return null;
-  
+
+  // Check "RIFF" or "RF64" (RF64 is used for files > 2 GB).
+  const magic = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+  if (magic !== 'RIFF' && magic !== 'RF64') return null;
+
   // Check "WAVE"
   const wave = String.fromCharCode(view.getUint8(8), view.getUint8(9), view.getUint8(10), view.getUint8(11));
   if (wave !== 'WAVE') return null;
-  
+
   let offset = 12;
   let sampleRate = 0;
   let channels = 0;
@@ -34,33 +47,42 @@ export function parseWavHeader(buffer: ArrayBuffer): WavHeader | null {
   let audioFormat = 0;
   let dataSize = 0;
   let dataOffset = 0;
-  
+  let ds64DataSize: number | null = null;
+
   // Scan chunks
   while (offset + 8 <= view.byteLength) {
     const chunkId = String.fromCharCode(
-      view.getUint8(offset),
-      view.getUint8(offset + 1),
-      view.getUint8(offset + 2),
-      view.getUint8(offset + 3)
+      view.getUint8(offset), view.getUint8(offset + 1), view.getUint8(offset + 2), view.getUint8(offset + 3)
     );
     const chunkSize = view.getUint32(offset + 4, true);
-    
-    if (chunkId === 'fmt ') {
+
+    if (chunkId === 'ds64') {
+      // ds64 data: riffSize(8), dataSize(8), sampleCount(8), tableLength(4)...
+      if (offset + 8 + 16 <= view.byteLength) {
+        ds64DataSize = Number(view.getBigUint64(offset + 8 + 8, true));
+      }
+    } else if (chunkId === 'fmt ') {
       audioFormat = view.getUint16(offset + 8, true);
       channels = view.getUint16(offset + 10, true);
       sampleRate = view.getUint32(offset + 12, true);
       bitsPerSample = view.getUint16(offset + 22, true);
+      // WAVE_FORMAT_EXTENSIBLE: the real format code is the first 2 bytes of
+      // the SubFormat GUID (fmt data offset 24 → file offset + 8 + 24).
+      if (audioFormat === WAVE_FORMAT_EXTENSIBLE && chunkSize >= 40 && offset + 8 + 24 + 2 <= view.byteLength) {
+        audioFormat = view.getUint16(offset + 8 + 24, true);
+      }
     } else if (chunkId === 'data') {
       dataOffset = offset + 8;
-      dataSize = chunkSize;
+      // RF64 stores 0xFFFFFFFF here and the true size in ds64.
+      dataSize = chunkSize === 0xffffffff && ds64DataSize !== null ? ds64DataSize : chunkSize;
       break;
     }
-    
+
     offset += 8 + chunkSize + (chunkSize % 2);
   }
-  
-  if (sampleRate === 0 || channels === 0) return null;
-  
+
+  if (sampleRate === 0 || channels === 0 || dataOffset === 0) return null;
+
   return {
     sampleRate,
     channels,
@@ -101,10 +123,10 @@ export class WavStreamParser {
         return null;
       }
 
-      const parsed = parseWavHeader(combined.buffer.slice(combined.byteOffset, combined.byteOffset + Math.min(2048, combined.length)));
+      const parsed = parseWavHeader(combined.buffer.slice(combined.byteOffset, combined.byteOffset + Math.min(MAX_WAV_HEADER_BYTES, combined.length)));
       if (!parsed) {
         // Not a valid WAV or need more header data
-        if (combined.length > 2048) {
+        if (combined.length > MAX_WAV_HEADER_BYTES) {
           throw new Error('Invalid WAV file header format.');
         }
         this.leftoverBytes = combined;
@@ -164,6 +186,16 @@ export class WavStreamParser {
   }
 
   private decodePCM(bytes: Uint8Array, header: WavHeader): Float32Array[] {
+    return decodeWavPcm(bytes, header);
+  }
+}
+
+/**
+ * Decodes a frame-aligned block of PCM bytes to Float32 channel buffers.
+ * `bytes.length` must be a whole multiple of the frame size. Shared by the
+ * stream parser and the region reader.
+ */
+export function decodeWavPcm(bytes: Uint8Array, header: WavHeader): Float32Array[] {
     const numChannels = header.channels;
     const bitsPerSample = header.bitsPerSample;
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
@@ -233,7 +265,6 @@ export class WavStreamParser {
     }
 
     return channelsData;
-  }
 }
 
 /**

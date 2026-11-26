@@ -480,6 +480,117 @@
   max-width: 65%;
 }
 
+/* Folder filter (run option for files discovered inside dropped folders) */
+.folder-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  font-size: 0.8rem;
+}
+
+.folder-filter-row .label {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.folder-filter-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  color: var(--text-main);
+  font-family: var(--font-primary);
+  font-size: 0.82rem;
+  outline: none;
+  transition: all 0.2s ease;
+}
+
+.folder-filter-row input:focus {
+  border-color: var(--color-primary);
+  background: rgba(0, 0, 0, 0.4);
+}
+
+/* Multi-chunk Recording list */
+.chunk-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.chunk-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  font-size: 0.8rem;
+}
+
+.chunk-row .value {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+}
+
+.chunk-index {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  min-width: 1.4em;
+  text-align: right;
+}
+
+.chunk-size {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.chunk-move {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.chunk-move-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--glass-border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 0.65rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.chunk-move-btn:hover:not(:disabled) {
+  color: var(--text-main);
+  border-color: var(--color-primary);
+}
+
+.chunk-move-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.chunk-indicator {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
 .no-file-loaded {
   display: flex;
   gap: 12px;

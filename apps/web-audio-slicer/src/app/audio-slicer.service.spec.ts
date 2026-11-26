@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TestBed } from '@angular/core/testing';
-import { createWavBytes, type ConfigStore } from '@web-audio-tools/audio-core';
+import { createWavBytes, DRY_EFFECT_CONFIG, type ConfigStore } from '@web-audio-tools/audio-core';
 import { AudioSlicerService } from './audio-slicer.service';
 import { CONFIG_STORE } from './config-store';
 import { SettingsService } from './settings.service';
@@ -101,12 +101,24 @@ afterEach(() => {
 });
 
 describe('AudioSlicerService', () => {
-  it('slices a WAV into tracks and exposes them via the stream', async () => {
+  it('slices a WAV into detected tracks (pending, not yet encoded)', async () => {
     const bytes = twoPieceWav();
     await service.runInput(chunks(bytes), { fileName: 'test.wav', fileSizeBytes: bytes.length });
 
     const tracks = service.getTracksValue();
     expect(tracks).toHaveLength(2);
+    expect(tracks.every(t => t.status === 'pending')).toBe(true);
+    expect(tracks.every(t => t.mp3Url === null && t.mp3Blob === null)).toBe(true);
+  });
+
+  it('exports detected tracks on demand to MP3', async () => {
+    const bytes = twoPieceWav();
+    const file = new File([bytes.buffer as ArrayBuffer], 'rehearsal.wav', { type: 'audio/wav' });
+    await service.sliceWavFile(file);
+    expect(service.getTracksValue().every(t => t.status === 'pending')).toBe(true);
+
+    await service.exportAll(DRY_EFFECT_CONFIG);
+    const tracks = service.getTracksValue();
     expect(tracks.every(t => t.status === 'done')).toBe(true);
     expect(tracks.every(t => t.mp3Url !== null && t.mp3Blob !== null)).toBe(true);
   });
@@ -116,7 +128,35 @@ describe('AudioSlicerService', () => {
     const file = new File([bytes.buffer as ArrayBuffer], 'rehearsal.wav', { type: 'audio/wav' });
     await service.sliceWavFile(file);
     expect(service.getTracksValue()).toHaveLength(2);
-    expect(service.getCurrentFile()).toBe(file);
+    expect(service.getCurrentFiles()).toEqual([file]);
+  });
+
+  it('sliceRecording joins chunks into one timeline: a piece spanning the split stays one track', async () => {
+    const first = concat(silence(2), tone(4, 0.5));
+    const second = concat(tone(6, 0.5), silence(3), tone(10, 0.5), silence(2));
+    const file1 = new File([createWavBytes([first, first], SR).buffer as ArrayBuffer], 'part1.wav', { type: 'audio/wav' });
+    const file2 = new File([createWavBytes([second, second], SR).buffer as ArrayBuffer], 'part2.wav', { type: 'audio/wav' });
+
+    const labels: string[] = [];
+    const sub = service.chunkLabel$.subscribe(label => labels.push(label));
+    await service.sliceRecording([file1, file2]);
+    sub.unsubscribe();
+
+    const tracks = service.getTracksValue();
+    expect(tracks).toHaveLength(2);
+    expect(service.getCurrentFiles()).toEqual([file1, file2]);
+    const boundarySec = first.length / SR;
+    expect(tracks[0].startTime).toBeLessThan(boundarySec);
+    expect(tracks[0].endTime).toBeGreaterThan(boundarySec);
+    expect(labels).toContain('Chunk 2 of 2');
+  });
+
+  it('rejects mismatched chunk formats before slicing', async () => {
+    const signal = silence(1);
+    const file1 = new File([createWavBytes([signal, signal], SR).buffer as ArrayBuffer], 'a.wav', { type: 'audio/wav' });
+    const file2 = new File([createWavBytes([signal, signal], 48000).buffer as ArrayBuffer], 'b.wav', { type: 'audio/wav' });
+    await expect(service.sliceRecording([file1, file2])).rejects.toThrow(/does not match/);
+    expect(service.getTracksValue()).toHaveLength(0);
   });
 
   it('updates a track title', async () => {
@@ -129,7 +169,9 @@ describe('AudioSlicerService', () => {
 
   it('removes a track and revokes its URL', async () => {
     const bytes = twoPieceWav();
-    await service.runInput(chunks(bytes), { fileSizeBytes: bytes.length });
+    const file = new File([bytes.buffer as ArrayBuffer], 'rehearsal.wav', { type: 'audio/wav' });
+    await service.sliceWavFile(file);
+    await service.exportAll(DRY_EFFECT_CONFIG);
     const url = service.getTracksValue()[0].mp3Url;
     const revokeSpy = vi.spyOn(URL, 'revokeObjectURL');
     service.removeTrack(1);

@@ -7,22 +7,35 @@
  * Set GEMINI_API_KEY or pass --gemini-key. Without a key, tracks are still
  * sliced and encoded, but titles stay generic.
  */
-import { basename, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
   DEFAULT_SLICER_PARAMETERS,
+  DRY_EFFECT_CONFIG,
+  FACTORY_PRESETS,
   GeminiModel,
   LameMp3Encoder,
   MusicBrainzClient,
   Slicer,
   Transcriber,
+  chunkStartTimesSec,
+  createRecordingInput,
+  createRegionSource,
+  exportRegionToMp3,
+  findFactoryPreset,
   isTranscriptionLanguageCode,
+  parsePresetFile,
+  type EffectChainConfig,
+  type Preset,
   type SlicerObserver,
   type TranscriptionLanguageCode
 } from '@web-audio-tools/audio-core';
-import { ensureDir, fileAudioInput, getFileSize, writeBytes } from './node-adapters';
+import { ensureDir, expandInputPaths, pathRecordingChunk, readTextFile, writeBytes } from './node-adapters';
 
 export interface CliOptions {
-  input: string;
+  /** Input files and/or directories, in the order given. */
+  inputs: string[];
+  /** Glob filter applied to files discovered inside directories (not to explicit files). */
+  match: string;
   outDir: string;
   thresholdDb: number;
   minSilenceDuration: number;
@@ -34,13 +47,20 @@ export interface CliOptions {
   trackStartIndex: number;
   transcribe: boolean;
   geminiKey: string;
+  /** Factory Preset name or path to a Preset JSON file; '' means dry (no effects). */
+  preset: string;
 }
 
 export function printHelp(): void {
-  console.log(`Usage: audio-cli <input.wav> [options]
+  console.log(`Usage: audio-cli <input.wav|dir> [more inputs...] [options]
+
+Multiple inputs form one Recording: their audio is joined into a single
+timeline, so pieces spanning a file boundary stay one track. Directories
+expand to their WAV files (natural-sorted by path, skipping TRASH/Export).
 
 Options:
   --out <dir>            Output directory (default: ./tracks)
+  --match <glob>         Filter files found in directories, e.g. '*_TrMic.WAV'
   --threshold <dB>       Silence threshold in dB (default: -45)
   --min-silence <sec>    Minimum silence to split (default: 2.0)
   --min-song <sec>       Minimum piece duration to keep (default: 8.0)
@@ -50,13 +70,16 @@ Options:
   --lang <code>          Transcription language: auto,en,de,es,fr,it,pt,nl,pl,ja (default: auto)
   --start-index <n>      Starting track number (default: 1)
   --no-transcribe        Skip speech transcription
+  --preset <name|file>   Apply a Factory Preset (e.g. "Horn Ensemble", "Rock Band")
+                         or a Preset JSON file at Export. Default: dry (no effects)
   --gemini-key <key>     Gemini API key (or set GEMINI_API_KEY)
   -h, --help             Show this help`);
 }
 
 export function parseArgs(argv: string[], env: Record<string, string | undefined> = {}): CliOptions | null {
   const options: CliOptions = {
-    input: '',
+    inputs: [],
+    match: '',
     outDir: './tracks',
     thresholdDb: DEFAULT_SLICER_PARAMETERS.thresholdDb,
     minSilenceDuration: DEFAULT_SLICER_PARAMETERS.minSilenceDuration,
@@ -67,7 +90,8 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
     language: 'auto',
     trackStartIndex: 1,
     transcribe: true,
-    geminiKey: env['GEMINI_API_KEY'] ?? ''
+    geminiKey: env['GEMINI_API_KEY'] ?? '',
+    preset: ''
   };
 
   const positional: string[] = [];
@@ -81,6 +105,9 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
         return null;
       case '--out':
         options.outDir = next();
+        break;
+      case '--match':
+        options.match = next();
         break;
       case '--threshold':
         options.thresholdDb = Number(next());
@@ -113,6 +140,9 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
       case '--no-transcribe':
         options.transcribe = false;
         break;
+      case '--preset':
+        options.preset = next();
+        break;
       case '--gemini-key':
         options.geminiKey = next();
         break;
@@ -126,7 +156,7 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
     return null;
   }
 
-  options.input = resolve(positional[0]);
+  options.inputs = positional.map(path => resolve(path));
   options.outDir = resolve(options.outDir);
   return options;
 }
@@ -135,6 +165,31 @@ export function sanitizeFileName(title: string, fallback: string): string {
   // eslint-disable-next-line no-control-regex
   const cleaned = title.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '').trim();
   return cleaned || fallback;
+}
+
+/**
+ * Resolves a --preset value to a Preset: a Factory Preset name, or a path to a
+ * versioned Preset JSON file. Returns null for dry (empty value). Throws on an
+ * unknown name or unreadable/invalid file.
+ */
+export async function resolvePreset(value: string): Promise<Preset | null> {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const factory = findFactoryPreset(trimmed);
+  if (factory) {
+    return factory;
+  }
+  if (trimmed.toLowerCase().endsWith('.json')) {
+    const preset = parsePresetFile(await readTextFile(resolve(trimmed)));
+    if (!preset) {
+      throw new Error(`Preset file "${trimmed}" is not a valid versioned Preset document.`);
+    }
+    return preset;
+  }
+  const names = FACTORY_PRESETS.map(p => p.name).join(', ');
+  throw new Error(`Unknown Preset "${trimmed}". Available Factory Presets: ${names}. Or pass a .json file path.`);
 }
 
 export function formatTime(seconds: number): string {
@@ -149,7 +204,22 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
     return;
   }
 
-  const fileSize = await getFileSize(options.input);
+  const paths = await expandInputPaths(options.inputs, options.match);
+  const chunks = await Promise.all(paths.map(pathRecordingChunk));
+  // Validates every chunk header up front: a format mismatch fails before
+  // any slicing starts, naming the offending files.
+  const recording = await createRecordingInput(chunks);
+  const displayName = chunks.length === 1
+    ? chunks[0].name
+    : `${chunks[0].name} (+${chunks.length - 1} ${chunks.length === 2 ? 'chunk' : 'chunks'})`;
+
+  if (chunks.length > 1) {
+    process.stderr.write(`Recording: ${chunks.length} chunks\n`);
+    chunks.forEach((chunk, index) => {
+      const sizeMb = ((chunk.sizeBytes ?? 0) / 1024 / 1024).toFixed(1);
+      process.stderr.write(`  ${index + 1}. ${chunk.name} (${sizeMb} MB)\n`);
+    });
+  }
 
   const transcription = options.transcribe && options.geminiKey.trim()
     ? new Transcriber({
@@ -169,7 +239,10 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
     onState: state => {
       if (state.status === 'slicing' && state.progress !== lastProgress && state.progress % 5 === 0) {
         lastProgress = state.progress;
-        process.stderr.write(`\rSlicing ${state.progress}% (${formatTime(state.currentTime)})`);
+        const chunkSuffix = chunks.length > 1
+          ? ` [chunk ${recording.currentChunkIndex + 1}/${chunks.length}]`
+          : '';
+        process.stderr.write(`\rSlicing ${state.progress}% (${formatTime(state.currentTime)})${chunkSuffix}`);
       }
     },
     onTrackAdded: track => {
@@ -182,8 +255,10 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
     }
   };
 
+  const preset = await resolvePreset(options.preset);
+  const effectConfig: EffectChainConfig = preset ? preset.config : DRY_EFFECT_CONFIG;
+
   const slicer = new Slicer({
-    encoderFactory: () => new LameMp3Encoder(),
     transcription,
     observer
   });
@@ -196,9 +271,9 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
     postRollSec: options.postRollSec
   };
 
-  const result = await slicer.run(fileAudioInput(options.input), {
-    fileName: basename(options.input),
-    fileSizeBytes: fileSize,
+  const result = await slicer.run(recording.input, {
+    fileName: displayName,
+    fileSizeBytes: recording.totalSizeBytes,
     trackStartIndex: options.trackStartIndex,
     transcribeSpeechGaps: options.transcribe
   });
@@ -207,12 +282,28 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
   await ensureDir(options.outDir);
 
   const manifestTracks = [];
-  for (const track of result.tracks) {
-    if (!track.mp3Bytes || track.status !== 'done') {
-      continue;
-    }
+  const tracks = result.tracks;
+  for (let i = 0; i < tracks.length; i++) {
+    const track = tracks[i];
+    const nextStart = i + 1 < tracks.length ? tracks[i + 1].startTime : undefined;
+    const maxDurationSec = nextStart !== undefined ? nextStart - track.startTime : undefined;
+    const source = createRegionSource(chunks, recording, track.startTime, track.endTime);
+    slicer.setTrackStatus(track.key, 'encoding');
+    const exported = await exportRegionToMp3(
+      source,
+      {
+        config: effectConfig,
+        sampleRate: recording.header.sampleRate,
+        sourceChannels: recording.header.channels,
+        maxDurationSec
+      },
+      () => new LameMp3Encoder(),
+      options.mp3Bitrate
+    );
+    slicer.applyExportResult(track.key, exported.mp3Bytes, exported.durationSec);
+
     const fileName = `${sanitizeFileName(track.title, `Track ${track.id}`)}.mp3`;
-    await writeBytes(join(options.outDir, fileName), track.mp3Bytes);
+    await writeBytes(join(options.outDir, fileName), exported.mp3Bytes);
     manifestTracks.push({
       id: track.id,
       title: track.title,
@@ -220,17 +311,27 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
       startTimeSeconds: track.startTime,
       endTimeSeconds: track.endTime,
       durationSeconds: track.duration,
+      processedDurationSeconds: exported.durationSec,
       file: fileName,
       transcription: track.transcription
     });
-    console.log(`Wrote ${fileName} (${formatTime(track.duration)})`);
+    console.log(`Wrote ${fileName} (${formatTime(exported.durationSec)})`);
   }
 
+  const chunkStartTimeSec = chunkStartTimesSec(recording);
+  const bytesPerSecond = recording.header.sampleRate * recording.header.channels * (recording.header.bitsPerSample / 8);
   const manifest = {
-    source: basename(options.input),
+    source: displayName,
     generatedAt: new Date().toISOString(),
     parameters: slicer.parameters,
+    preset: preset ? { name: preset.name, config: preset.config } : null,
     language: options.language,
+    chunks: chunks.map((chunk, index) => ({
+      file: chunk.name,
+      sizeBytes: chunk.sizeBytes ?? null,
+      startTimeSeconds: chunkStartTimeSec[index],
+      durationSeconds: bytesPerSecond > 0 ? recording.chunkDataBytes[index] / bytesPerSecond : 0
+    })),
     tracks: manifestTracks,
     segments: result.segments.map(s => ({
       id: s.id,

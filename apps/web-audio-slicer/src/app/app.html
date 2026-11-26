@@ -307,7 +307,7 @@
         (drop)="onDrop($event)"
       >
         <i class="fa-solid fa-file-audio upload-icon"></i>
-        <p class="primary-drop-text">Drag & drop your large WAV file here</p>
+        <p class="primary-drop-text">Drag & drop WAV files or folders here</p>
         <p class="secondary-drop-text">or</p>
         <label for="file-upload" class="file-label btn btn-secondary">
           <i class="fa-solid fa-folder-open"></i> Browse Files
@@ -317,20 +317,59 @@
           id="file-upload" 
           (change)="onFileSelected($event)" 
           accept="audio/wav,audio/x-wav" 
+          multiple
           style="display: none;" 
         />
       </div>
 
-      @if (file; as selectedFile) {
+      <div class="folder-filter-row">
+        <label for="folder-filter" class="label">Folder filter</label>
+        <input
+          type="text"
+          id="folder-filter"
+          placeholder="file name contains… (e.g. TrMic)"
+          [(ngModel)]="fileNameFilter"
+        />
+      </div>
+      <p class="help-text">
+        Optional. Applied to files discovered inside dropped folders (TRASH and Export are always skipped).
+        Split recordings: drop all continuation files or folders together — they are sliced as one continuous recording.
+      </p>
+
+      @if (files.length > 0) {
         <div class="file-details">
-          <div class="file-info-row">
-            <span class="label">Name:</span>
-            <span class="value text-ellipsis" [title]="selectedFile.name">{{ selectedFile.name }}</span>
-          </div>
-          <div class="file-info-row">
-            <span class="label">Size:</span>
-            <span class="value">{{ (selectedFile.size / 1024 / 1024) | number:'1.1-2' }} MB</span>
-          </div>
+          @if (files.length === 1) {
+            <div class="file-info-row">
+              <span class="label">Name:</span>
+              <span class="value text-ellipsis" [title]="files[0].name">{{ files[0].name }}</span>
+            </div>
+            <div class="file-info-row">
+              <span class="label">Size:</span>
+              <span class="value">{{ (files[0].size / 1024 / 1024) | number:'1.1-2' }} MB</span>
+            </div>
+          } @else {
+            <div class="file-info-row">
+              <span class="label">Recording:</span>
+              <span class="value">{{ files.length }} chunks, {{ (totalSizeBytes / 1024 / 1024) | number:'1.1-2' }} MB</span>
+            </div>
+            <ul class="chunk-list">
+              @for (chunk of files; track chunk; let i = $index) {
+                <li class="chunk-row">
+                  <span class="chunk-index">{{ i + 1 }}</span>
+                  <span class="value text-ellipsis" [title]="chunk.name">{{ chunk.name }}</span>
+                  <span class="chunk-size">{{ (chunk.size / 1024 / 1024) | number:'1.1-2' }} MB</span>
+                  <span class="chunk-move">
+                    <button class="chunk-move-btn" (click)="moveChunk(i, -1)" [disabled]="i === 0" title="Move earlier">
+                      <i class="fa-solid fa-arrow-up"></i>
+                    </button>
+                    <button class="chunk-move-btn" (click)="moveChunk(i, 1)" [disabled]="i === files.length - 1" title="Move later">
+                      <i class="fa-solid fa-arrow-down"></i>
+                    </button>
+                  </span>
+                </li>
+              }
+            </ul>
+          }
           @if (state.totalDurationEstimate) {
             <div class="file-info-row">
               <span class="label">Est. Duration:</span>
@@ -371,7 +410,7 @@
               </p>
 
               <p class="help-text analysis-option-help">
-                Use a higher starting index when the record continues in another WAV file.
+                Use a higher starting index to continue track numbering from a previous run.
               </p>
 
               <button 
@@ -455,7 +494,7 @@
         @if (state.status !== 'idle') {
           <div class="progress-details-block">
             <div class="progress-percentage-row">
-              <span>Progress: {{ state.progress }}%</span>
+              <span>Progress: {{ state.progress }}% @if (chunkLabel) { <span class="chunk-indicator">· {{ chunkLabel }}</span> }</span>
               <span>{{ formatTime(state.currentTime) }} / {{ formatTime(state.totalDurationEstimate) }}</span>
             </div>
             <div class="progress-track">
@@ -476,6 +515,166 @@
     </section>
   </main>
 
+  <!-- Effects & Presets (Audition) -->
+  @if (tracks.length > 0) {
+    <section class="card-panel glass-panel presets-section">
+      <div class="section-actions-header">
+        <h2><i class="fa-solid fa-sliders text-purple"></i> Effects &amp; Presets</h2>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+          @if (audition.trackKey() !== null) {
+            <button class="btn btn-secondary" (click)="toggleDryWet()" title="Compare processed (wet) vs original (dry)">
+              <i class="fa-solid fa-half-stroke"></i> {{ audition.mode() === 'wet' ? 'Wet' : 'Dry' }}
+            </button>
+            <button class="btn btn-secondary" (click)="stopAudition()" title="Stop auditioning">
+              <i class="fa-solid fa-stop"></i> Stop
+            </button>
+          }
+        </div>
+      </div>
+
+      <p class="section-desc">
+        Pick a Preset, audition any Track with the headphones button, tweak the effects, then Export.
+        Audition and Export use the same processing, so what you hear is what you get.
+      </p>
+
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:10px 0">
+        <label class="meta-label" for="preset-select">Preset:</label>
+        <select id="preset-select" class="title-edit-input" style="max-width:240px"
+                [ngModel]="presets.selectedName() ?? ''" (ngModelChange)="selectPreset($event)">
+          <option value="">Dry (no effects)</option>
+          @for (preset of presets.allPresets(); track preset.name) {
+            <option [value]="preset.name">{{ preset.name }}{{ presets.isFactory(preset.name) ? '' : ' (user)' }}</option>
+          }
+        </select>
+
+        @if (presets.modified()) {
+          <span class="track-count-badge">modified</span>
+        }
+        <button class="btn btn-secondary" (click)="savePreset()" title="Save the working config as a new user Preset">
+          <i class="fa-solid fa-floppy-disk"></i> Save As
+        </button>
+        <label class="btn btn-secondary" style="cursor:pointer" title="Import a Preset JSON file">
+          <i class="fa-solid fa-file-import"></i> Import
+          <input type="file" accept="application/json,.json" style="display:none" (change)="importPreset($event)" />
+        </label>
+        @if (presets.selectedPreset(); as selected) {
+          <button class="btn btn-secondary" (click)="exportPresetFile(selected)" title="Export this Preset as JSON">
+            <i class="fa-solid fa-file-export"></i> Export JSON
+          </button>
+          @if (!presets.isFactory(selected.name)) {
+            <button class="btn btn-secondary" (click)="deletePreset(selected.name)" title="Delete this user Preset">
+              <i class="fa-solid fa-trash"></i>
+            </button>
+          }
+        }
+      </div>
+
+      @if (audition.trackKey() !== null) {
+        <p class="help-text">
+          <i class="fa-solid fa-headphones"></i>
+          Auditioning Track #{{ audition.trackKey() }}
+          @if (audition.rendering()) { — rendering… }
+          @if (audition.error()) { — <span style="color:#f87171">{{ audition.error() }}</span> }
+        </p>
+      }
+
+      <div class="effects-grid" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; margin-top:12px">
+        <!-- Noise Reduction -->
+        <div class="glass-panel" style="padding:10px">
+          <label style="display:flex; gap:8px; align-items:center; font-weight:600">
+            <input type="checkbox" [ngModel]="presets.workingConfig().noiseReduction.enabled"
+                   (ngModelChange)="updateEffect('noiseReduction', {enabled: $event})" />
+            Noise Reduction
+          </label>
+          <div class="meta-item" style="margin-top:6px">
+            <span class="meta-label">Strength</span>
+            <input type="range" min="0" max="1" step="0.05" style="width:100%"
+                   [ngModel]="presets.workingConfig().noiseReduction.strength"
+                   (ngModelChange)="updateEffect('noiseReduction', {strength: +$event})" />
+          </div>
+        </div>
+
+        <!-- EQ -->
+        <div class="glass-panel" style="padding:10px">
+          <label style="display:flex; gap:8px; align-items:center; font-weight:600">
+            <input type="checkbox" [ngModel]="presets.workingConfig().eq.enabled"
+                   (ngModelChange)="updateEffect('eq', {enabled: $event})" />
+            EQ
+          </label>
+          <div class="meta-item"><span class="meta-label">Low (dB)</span>
+            <input type="range" min="-12" max="12" step="0.5" style="width:100%"
+                   [ngModel]="presets.workingConfig().eq.lowGainDb" (ngModelChange)="updateEffect('eq', {lowGainDb: +$event})" /></div>
+          <div class="meta-item"><span class="meta-label">Mid (dB)</span>
+            <input type="range" min="-12" max="12" step="0.5" style="width:100%"
+                   [ngModel]="presets.workingConfig().eq.midGainDb" (ngModelChange)="updateEffect('eq', {midGainDb: +$event})" /></div>
+          <div class="meta-item"><span class="meta-label">Mid freq (Hz)</span>
+            <input type="range" min="200" max="6000" step="50" style="width:100%"
+                   [ngModel]="presets.workingConfig().eq.midFrequencyHz" (ngModelChange)="updateEffect('eq', {midFrequencyHz: +$event})" /></div>
+          <div class="meta-item"><span class="meta-label">High (dB)</span>
+            <input type="range" min="-12" max="12" step="0.5" style="width:100%"
+                   [ngModel]="presets.workingConfig().eq.highGainDb" (ngModelChange)="updateEffect('eq', {highGainDb: +$event})" /></div>
+        </div>
+
+        <!-- Compressor -->
+        <div class="glass-panel" style="padding:10px">
+          <label style="display:flex; gap:8px; align-items:center; font-weight:600">
+            <input type="checkbox" [ngModel]="presets.workingConfig().compressor.enabled"
+                   (ngModelChange)="updateEffect('compressor', {enabled: $event})" />
+            Compressor
+          </label>
+          <div class="meta-item"><span class="meta-label">Threshold (dB)</span>
+            <input type="range" min="-60" max="0" step="1" style="width:100%"
+                   [ngModel]="presets.workingConfig().compressor.thresholdDb" (ngModelChange)="updateEffect('compressor', {thresholdDb: +$event})" /></div>
+          <div class="meta-item"><span class="meta-label">Ratio</span>
+            <input type="range" min="1" max="20" step="0.5" style="width:100%"
+                   [ngModel]="presets.workingConfig().compressor.ratio" (ngModelChange)="updateEffect('compressor', {ratio: +$event})" /></div>
+          <div class="meta-item"><span class="meta-label">Attack (ms)</span>
+            <input type="range" min="0.5" max="100" step="0.5" style="width:100%"
+                   [ngModel]="presets.workingConfig().compressor.attackMs" (ngModelChange)="updateEffect('compressor', {attackMs: +$event})" /></div>
+          <div class="meta-item"><span class="meta-label">Release (ms)</span>
+            <input type="range" min="10" max="1000" step="10" style="width:100%"
+                   [ngModel]="presets.workingConfig().compressor.releaseMs" (ngModelChange)="updateEffect('compressor', {releaseMs: +$event})" /></div>
+          <div class="meta-item"><span class="meta-label">Makeup (dB)</span>
+            <input type="range" min="0" max="24" step="0.5" style="width:100%"
+                   [ngModel]="presets.workingConfig().compressor.makeupDb" (ngModelChange)="updateEffect('compressor', {makeupDb: +$event})" /></div>
+        </div>
+
+        <!-- Reverb -->
+        <div class="glass-panel" style="padding:10px">
+          <label style="display:flex; gap:8px; align-items:center; font-weight:600">
+            <input type="checkbox" [ngModel]="presets.workingConfig().reverb.enabled"
+                   (ngModelChange)="updateEffect('reverb', {enabled: $event})" />
+            Reverb
+          </label>
+          <div class="meta-item"><span class="meta-label">Room size</span>
+            <input type="range" min="0" max="1" step="0.05" style="width:100%"
+                   [ngModel]="presets.workingConfig().reverb.roomSize" (ngModelChange)="updateEffect('reverb', {roomSize: +$event})" /></div>
+          <div class="meta-item"><span class="meta-label">Damping</span>
+            <input type="range" min="0" max="1" step="0.05" style="width:100%"
+                   [ngModel]="presets.workingConfig().reverb.damping" (ngModelChange)="updateEffect('reverb', {damping: +$event})" /></div>
+          <div class="meta-item"><span class="meta-label">Wet</span>
+            <input type="range" min="0" max="1" step="0.05" style="width:100%"
+                   [ngModel]="presets.workingConfig().reverb.wet" (ngModelChange)="updateEffect('reverb', {wet: +$event})" /></div>
+          <div class="meta-item"><span class="meta-label">Dry</span>
+            <input type="range" min="0" max="1" step="0.05" style="width:100%"
+                   [ngModel]="presets.workingConfig().reverb.dry" (ngModelChange)="updateEffect('reverb', {dry: +$event})" /></div>
+        </div>
+
+        <!-- Normalize -->
+        <div class="glass-panel" style="padding:10px">
+          <label style="display:flex; gap:8px; align-items:center; font-weight:600">
+            <input type="checkbox" [ngModel]="presets.workingConfig().normalize.enabled"
+                   (ngModelChange)="updateEffect('normalize', {enabled: $event})" />
+            Normalize
+          </label>
+          <div class="meta-item" style="margin-top:6px"><span class="meta-label">Target peak (dB)</span>
+            <input type="range" min="-24" max="0" step="0.5" style="width:100%"
+                   [ngModel]="presets.workingConfig().normalize.targetPeakDb" (ngModelChange)="updateEffect('normalize', {targetPeakDb: +$event})" /></div>
+        </div>
+      </div>
+    </section>
+  }
+
   <!-- Track Slices Section -->
   @if (tracks.length > 0) {
     <section class="card-panel glass-panel tracks-section">
@@ -486,14 +685,20 @@
           <span class="track-count-badge">{{ tracks.length }} found</span>
         </h2>
         
-        <button 
-          class="btn btn-secondary btn-download-all" 
-          (click)="downloadAll()"
-          title="Download all completed track MP3s sequentially"
+        <button
+          class="btn btn-secondary btn-download-all"
+          (click)="exportAndDownloadAll()"
+          [disabled]="exportingAll"
+          title="Apply the selected Preset to every Track, encode, and download"
         >
-          <i class="fa-solid fa-circle-down"></i> Download All Slices
+          <i class="fa-solid" [ngClass]="exportingAll ? 'fa-spinner fa-spin' : 'fa-circle-down'"></i>
+          {{ exportingAll ? 'Exporting…' : 'Export All Slices' }}
         </button>
       </div>
+
+      @if (exportError) {
+        <p class="help-text" style="color:#f87171">Export failed: {{ exportError }}</p>
+      }
 
       <!-- Tracks Grid -->
       <div class="tracks-list">
@@ -559,21 +764,30 @@
               }
 
               <div class="track-card-actions">
-                <!-- Audio Preview Player -->
+                <!-- Audio Preview Player (encoded MP3, after Export) -->
                 @if (track.status === 'done') {
                   <div class="player-wrapper">
                     <audio [src]="track.mp3Url" controls class="html5-player" (play)="pauseOtherPlayers($event)"></audio>
                   </div>
                 }
 
-                <!-- Single Download Button -->
-                <button 
-                  class="btn btn-secondary btn-icon-only" 
-                  [disabled]="track.status !== 'done'"
-                  (click)="downloadTrack(track)" 
-                  title="Download Track MP3"
+                <!-- Audition (render-to-preview with the working Preset) -->
+                <button
+                  class="btn btn-secondary btn-icon-only"
+                  (click)="auditionTrack(track)"
+                  [title]="audition.trackKey() === track.key ? 'Auditioning with the selected Preset' : 'Audition with the selected Preset'"
                 >
-                  <i class="fa-solid fa-download"></i>
+                  <i class="fa-solid" [ngClass]="audition.trackKey() === track.key && audition.rendering() ? 'fa-spinner fa-spin' : 'fa-headphones'"></i>
+                </button>
+
+                <!-- Export + Download (processes on demand) -->
+                <button
+                  class="btn btn-secondary btn-icon-only"
+                  (click)="downloadTrack(track)"
+                  [disabled]="track.status === 'encoding'"
+                  title="Export (apply Preset + encode) and download this Track"
+                >
+                  <i class="fa-solid" [ngClass]="track.status === 'encoding' ? 'fa-spinner fa-spin' : 'fa-download'"></i>
                 </button>
 
                 <!-- Track actions menu (overlay rendered at the app root) -->

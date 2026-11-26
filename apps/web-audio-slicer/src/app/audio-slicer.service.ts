@@ -3,7 +3,14 @@ import { BehaviorSubject, Subject } from 'rxjs';
 import {
   Slicer,
   bytesToBlob,
+  createRecordingInput,
+  createRegionSource,
+  exportRegionToMp3,
   type AudioInput,
+  type EffectChainConfig,
+  type RecordingChunk,
+  type RecordingInput,
+  type RegionSource,
   type SilenceSegment,
   type SliceOptions,
   type SlicerState,
@@ -39,23 +46,29 @@ export class AudioSlicerService {
   private tracks = new BehaviorSubject<Track[]>([]);
   private segments = new BehaviorSubject<SilenceSegment[]>([]);
   private volumeLevel = new Subject<number>();
+  private chunkLabel = new BehaviorSubject<string>('');
 
   public state$ = this.state.asObservable();
   public tracks$ = this.tracks.asObservable();
   public segments$ = this.segments.asObservable();
   public volumeLevel$ = this.volumeLevel.asObservable();
+  /** "Chunk i of n" while a multi-chunk Recording is being sliced; '' otherwise. */
+  public chunkLabel$ = this.chunkLabel.asObservable();
 
   private readonly transcriptionService = inject(TranscriptionService);
   private readonly settingsService = inject(SettingsService);
-  private currentFile: File | null = null;
+  private currentFiles: File[] = [];
+  private currentRecording: RecordingInput | null = null;
 
   /** Persistent core slicer; its observer drives the RxJS streams the UI consumes. */
   private readonly core = new Slicer({
-    encoderFactory: () => new WorkerMp3Encoder(),
     transcription: null,
     scheduler: browserScheduler,
     observer: {
-      onState: state => this.state.next(state),
+      onState: state => {
+        this.state.next(state);
+        this.updateChunkLabel();
+      },
       onVolume: db => this.volumeLevel.next(db),
       onTrackAdded: track => this.tracks.next([...this.tracks.getValue(), this.toBrowserTrack(track)]),
       onTrackUpdated: track => this.tracks.next(this.tracks.getValue().map(t => t.key === track.key ? this.toBrowserTrack(track) : t)),
@@ -76,8 +89,8 @@ export class AudioSlicerService {
     return this.core;
   }
 
-  public getCurrentFile(): File | null {
-    return this.currentFile;
+  public getCurrentFiles(): File[] {
+    return this.currentFiles;
   }
 
   public getTracksValue(): Track[] {
@@ -110,6 +123,9 @@ export class AudioSlicerService {
     this.revokeAllUrls();
     this.tracks.next([]);
     this.segments.next([]);
+    // The loaded Recording survives a reset (like the previous currentFile),
+    // so tool-driven runs can slice it again; a new load replaces it.
+    this.chunkLabel.next('');
     this.state.next({
       status: 'idle',
       fileName: '',
@@ -127,13 +143,103 @@ export class AudioSlicerService {
    * wiring browser adapters (Worker encoder, Prompt API/Gemini transcription).
    */
   public async sliceWavFile(file: File, options: SliceOptions = {}): Promise<void> {
+    await this.sliceRecording([file], options);
+  }
+
+  /**
+   * Slices a Recording: one or more WAV files joined into a single continuous
+   * timeline. A single file is a one-chunk Recording — the same code path.
+   */
+  public async sliceRecording(files: File[], options: SliceOptions = {}): Promise<void> {
     this.reset();
-    this.currentFile = file;
-    await this.runInput(file.stream(), {
+    this.currentFiles = [...files];
+    const recording = await createRecordingInput(this.toRecordingChunks(files));
+    this.currentRecording = recording;
+    const displayName = files.length === 1
+      ? files[0].name
+      : `${files[0].name} (+${files.length - 1} ${files.length === 2 ? 'chunk' : 'chunks'})`;
+    await this.runInput(recording.input, {
       ...options,
-      fileName: file.name,
-      fileSizeBytes: file.size
+      fileName: displayName,
+      fileSizeBytes: recording.totalSizeBytes
     });
+  }
+
+  /** Builds RecordingChunks from browser Files (used by the UI and WebMCP). */
+  public toRecordingChunks(files: File[]): RecordingChunk[] {
+    return files.map(file => ({
+      name: file.name,
+      sizeBytes: file.size,
+      open: () => file.stream(),
+      openRange: (startByte, endByte) => file.slice(startByte, endByte).stream()
+    }));
+  }
+
+  public getCurrentRecording(): RecordingInput | null {
+    return this.currentRecording;
+  }
+
+  /** A re-readable region source for one Track (the shared Audition/Export path). */
+  public regionSourceFor(track: CoreTrack): RegionSource {
+    const recording = this.currentRecording;
+    if (!recording || this.currentFiles.length === 0) {
+      throw new Error('No Recording is loaded; slice a file before exporting or auditioning.');
+    }
+    return createRegionSource(this.toRecordingChunks(this.currentFiles), recording, track.startTime, track.endTime);
+  }
+
+  /**
+   * On-demand Export of one Track: re-read its region, apply the effect config,
+   * encode to MP3 (Worker encoder), and record the result on the core Track.
+   * The reverb tail is capped so it never reaches the next Track's start.
+   */
+  public async exportTrack(trackKey: number, config: EffectChainConfig): Promise<{ durationSec: number } | null> {
+    const recording = this.currentRecording;
+    const tracks = this.core.getTracksValue();
+    const index = tracks.findIndex(t => t.key === trackKey);
+    if (!recording || index < 0) {
+      return null;
+    }
+    const track = tracks[index];
+    const nextStart = index + 1 < tracks.length ? tracks[index + 1].startTime : undefined;
+    const maxDurationSec = nextStart !== undefined ? nextStart - track.startTime : undefined;
+    this.core.setTrackStatus(trackKey, 'encoding');
+    try {
+      const result = await exportRegionToMp3(
+        this.regionSourceFor(track),
+        {
+          config,
+          sampleRate: recording.header.sampleRate,
+          sourceChannels: recording.header.channels,
+          maxDurationSec,
+          scheduler: browserScheduler
+        },
+        () => new WorkerMp3Encoder(),
+        this.settingsService.slicerParameters().mp3Bitrate
+      );
+      this.core.applyExportResult(trackKey, result.mp3Bytes, result.durationSec);
+      return { durationSec: result.durationSec };
+    } catch (error) {
+      this.core.applyExportResult(trackKey, null);
+      throw error;
+    }
+  }
+
+  /** Exports every detected Track in order with the given effect config. */
+  public async exportAll(config: EffectChainConfig): Promise<void> {
+    for (const track of [...this.core.getTracksValue()]) {
+      await this.exportTrack(track.key, config);
+    }
+  }
+
+  private updateChunkLabel(): void {
+    const recording = this.currentRecording;
+    const label = recording && recording.chunkDataBytes.length > 1
+      ? `Chunk ${recording.currentChunkIndex + 1} of ${recording.chunkDataBytes.length}`
+      : '';
+    if (label !== this.chunkLabel.getValue()) {
+      this.chunkLabel.next(label);
+    }
   }
 
   /** Runs the core slicer over an arbitrary input (used by the UI and tools). */

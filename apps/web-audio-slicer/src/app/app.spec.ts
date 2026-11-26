@@ -33,7 +33,7 @@ function makeTrack(id: number): Track {
 let fixture: ComponentFixture<App>;
 let component: App;
 let store: MemoryConfigStore;
-let audioMock: { removeTrack: ReturnType<typeof vi.fn>; updateTrackTitle: ReturnType<typeof vi.fn>; reset: ReturnType<typeof vi.fn>; sliceWavFile: ReturnType<typeof vi.fn> };
+let audioMock: { removeTrack: ReturnType<typeof vi.fn>; updateTrackTitle: ReturnType<typeof vi.fn>; reset: ReturnType<typeof vi.fn>; sliceRecording: ReturnType<typeof vi.fn> };
 let transcriptionMock: { refreshPromptApiDiagnostics: ReturnType<typeof vi.fn> };
 
 beforeEach(async () => {
@@ -53,7 +53,8 @@ beforeEach(async () => {
     tracks$: new BehaviorSubject<Track[]>([makeTrack(1)]).asObservable(),
     segments$: new BehaviorSubject([]).asObservable(),
     volumeLevel$: new Subject<number>().asObservable(),
-    sliceWavFile: vi.fn(async () => undefined),
+    chunkLabel$: new BehaviorSubject<string>('').asObservable(),
+    sliceRecording: vi.fn(async () => undefined),
     cancelSlicing: vi.fn()
   } as unknown as typeof audioMock;
 
@@ -153,12 +154,30 @@ describe('App component', () => {
 
   it('startSlicing uses the persisted transcribe-speech-gaps setting', async () => {
     component.transcribeSpeechGapsOnStart = false;
-    component.file = { name: 'test.wav' } as File;
+    component.files = [{ name: 'test.wav' } as File];
     await component.startSlicing();
-    expect(audioMock.sliceWavFile).toHaveBeenCalledWith(component.file, {
+    expect(audioMock.sliceRecording).toHaveBeenCalledWith(component.files, {
       transcribeSpeechGaps: false,
       trackStartIndex: 1
     });
+  });
+
+  it('selecting multiple files sorts them naturally by name and replaces the recording', () => {
+    const make = (name: string) => new File([], name, { type: 'audio/wav' });
+    const input = { files: [make('ZOOM0010.WAV'), make('ZOOM0002.WAV'), make('ZOOM0001.WAV')] } as unknown as HTMLInputElement;
+    component.onFileSelected({ target: input } as unknown as Event);
+    expect(component.files.map(f => f.name)).toEqual(['ZOOM0001.WAV', 'ZOOM0002.WAV', 'ZOOM0010.WAV']);
+    expect(audioMock.reset).toHaveBeenCalled();
+  });
+
+  it('moveChunk reorders chunks and clamps at the ends', () => {
+    const make = (name: string) => new File([], name, { type: 'audio/wav' });
+    component.files = [make('a.wav'), make('b.wav'), make('c.wav')];
+    component.moveChunk(0, 1);
+    expect(component.files.map(f => f.name)).toEqual(['b.wav', 'a.wav', 'c.wav']);
+    component.moveChunk(0, -1);
+    component.moveChunk(2, 1);
+    expect(component.files.map(f => f.name)).toEqual(['b.wav', 'a.wav', 'c.wav']);
   });
 
   it('toggles the track menu and closes on document click', () => {

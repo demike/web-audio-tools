@@ -1,12 +1,13 @@
 /**
  * Platform-agnostic slicing pipeline: WAV stream parsing, the SILENCE/SONG
- * hysteresis state machine, MP3 encoding (via an encoder port), and speech-gap
- * transcription (via a transcription port). No Angular, DOM, Worker, or Node
- * APIs are referenced here — those live in adapters at the seams.
+ * hysteresis state machine, and speech-gap transcription (via a transcription
+ * port). Detection only — it finds Track boundaries and prepares gaps; it does
+ * NOT encode. Effects and MP3 encoding happen later, on demand, in processing.ts
+ * (the shared Audition/Export path). No Angular, DOM, Worker, or Node APIs are
+ * referenced here — those live in adapters at the seams.
  */
 import type {
   AudioInput,
-  Mp3EncoderPort,
   Scheduler,
   SlicerObserver,
   TranscriptionPort
@@ -24,7 +25,6 @@ import {
 import { WavStreamParser, calculateRms, createWavBytes, prepareSpeechAudio, rmsToDb } from './wav';
 
 export interface SlicerDeps {
-  encoderFactory: () => Mp3EncoderPort;
   transcription?: TranscriptionPort | null;
   observer?: SlicerObserver;
   scheduler?: Scheduler;
@@ -38,7 +38,6 @@ const defaultScheduler: Scheduler = {
 export class Slicer {
   public parameters: SlicerParameters = { ...DEFAULT_SLICER_PARAMETERS };
 
-  private readonly encoderFactory: () => Mp3EncoderPort;
   /** Mutable so hosts can switch between embedded and calling-model transcription. */
   public transcription: TranscriptionPort | null;
   private readonly observer: SlicerObserver;
@@ -50,8 +49,7 @@ export class Slicer {
   private cancelRequested = false;
   private pendingTranscriptions: Array<Promise<void>> = [];
 
-  constructor(deps: SlicerDeps) {
-    this.encoderFactory = deps.encoderFactory;
+  constructor(deps: SlicerDeps = {}) {
     this.transcription = deps.transcription ?? null;
     this.observer = deps.observer ?? {};
     this.scheduler = deps.scheduler ?? defaultScheduler;
@@ -99,6 +97,33 @@ export class Slicer {
     }
   }
 
+  /** Marks a detected Track as being processed/encoded by the Export stage. */
+  public setTrackStatus(trackKey: number, status: Track['status']): void {
+    const track = this.tracks.find(t => t.key === trackKey);
+    if (track) {
+      track.status = status;
+      this.observer.onTrackUpdated?.(track);
+    }
+  }
+
+  /**
+   * Records the result of the on-demand Export stage onto a detected Track.
+   * The Track's boundaries stay the sliced truth; the encoded audio may ring
+   * past them (reverb tail), so the processed duration is reported separately.
+   */
+  public applyExportResult(trackKey: number, mp3Bytes: Uint8Array | null, processedDurationSec?: number): void {
+    const track = this.tracks.find(t => t.key === trackKey);
+    if (!track) {
+      return;
+    }
+    track.mp3Bytes = mp3Bytes;
+    track.status = mp3Bytes ? 'done' : 'failed';
+    if (processedDurationSec !== undefined) {
+      track.processedDuration = processedDurationSec;
+    }
+    this.observer.onTrackUpdated?.(track);
+  }
+
   public async run(input: AudioInput, options: SliceOptions = {}): Promise<SliceResult> {
     this.reset(options.fileName ?? '');
     this.cancelRequested = false;
@@ -121,7 +146,6 @@ export class Slicer {
     let nextTrackIndex = trackStartIndex;
     let currentSongTrack: Track | null = null;
     let songStartSec = 0;
-    let currentEncoder: Mp3EncoderPort | null = null;
     const getCurrentSongTrack = (): Track | null => currentSongTrack;
 
     let silenceSegmentCounter = 0;
@@ -189,43 +213,6 @@ export class Slicer {
       });
     };
 
-    const feedEncoder = async (channels: Float32Array[]): Promise<void> => {
-      if (currentEncoder) {
-        await currentEncoder.encode(this.normalizeChannelsForMp3(channels));
-      }
-    };
-
-    const startTrackEncoder = async (channels: number, rate: number, windowChannels: Float32Array[], preRollChannels: Float32Array[] = []): Promise<void> => {
-      currentEncoder = this.encoderFactory();
-      await currentEncoder.start(channels, rate, this.parameters.mp3Bitrate);
-      if (preRollChannels.length > 0 && (preRollChannels[0]?.length ?? 0) > 0) {
-        await feedEncoder(preRollChannels);
-      }
-      await feedEncoder(windowChannels);
-    };
-
-    const finishTrackEncoder = async (track: Track): Promise<void> => {
-      if (!currentEncoder) {
-        return;
-      }
-      const encoder = currentEncoder;
-      currentEncoder = null;
-      try {
-        const bytes = await encoder.finish();
-        track.mp3Bytes = bytes;
-        track.status = 'done';
-      } catch (error) {
-        track.status = 'failed';
-        console.error('MP3 encoding failed:', error);
-      }
-      this.observer.onTrackUpdated?.(track);
-    };
-
-    const abortTrackEncoder = (): void => {
-      currentEncoder?.abort();
-      currentEncoder = null;
-    };
-
     const processWindow = async (windowChannels: Float32Array[]): Promise<void> => {
       const windowSampleCount = windowChannels[0]?.length ?? 0;
       if (windowSampleCount === 0) {
@@ -282,14 +269,12 @@ export class Slicer {
             duration: 0,
             mp3Bytes: null,
             transcription: null,
-            status: 'encoding'
+            status: 'pending'
           };
 
           this.tracks.push(currentSongTrack);
           this.observer.onTrackAdded?.(currentSongTrack);
           this.patchState({ currentTrackId: currentSongTrack.id });
-
-          await startTrackEncoder(this.getMp3ExportChannelCount(numChannels), sampleRate, windowChannels, preRoll);
 
           shortSongBuffer = this.createChannelChunkBuffers(numChannels);
           shortSongBufferSec = 0;
@@ -329,7 +314,6 @@ export class Slicer {
               if (postRollSamples > 0 && this.hasChannelChunks(pendingSilenceBuffer)) {
                 const mergedPending = this.mergeChannelChunks(pendingSilenceBuffer);
                 const take = Math.min(postRollSamples, mergedPending[0].length);
-                await feedEncoder(mergedPending.map(ch => ch.subarray(0, take)));
                 appliedPostRollSec = take / sampleRate;
                 pendingSilenceBuffer = mergedPending.map(ch => {
                   const rest = ch.subarray(take);
@@ -341,7 +325,7 @@ export class Slicer {
               currentSongTrack.endTime = songEndSec + appliedPostRollSec;
               currentSongTrack.duration = currentSongTrack.endTime - songStartSec;
               nextTrackIndex++;
-              await finishTrackEncoder(currentSongTrack);
+              this.observer.onTrackUpdated?.(currentSongTrack);
             } else if (currentSongTrack) {
               if (!shortSongBufferComplete && songDuration > 0.5 && this.hasChannelChunks(shortSongBuffer)) {
                 silenceSegmentCounter++;
@@ -355,7 +339,6 @@ export class Slicer {
                 };
                 this.registerSilenceSegment(segment, this.mergeChannelChunks(shortSongBuffer), sampleRate, trackKeyCounter + 1, transcribeSpeechGaps);
               }
-              abortTrackEncoder();
               this.removeTrack(currentSongTrack.key);
             }
 
@@ -371,11 +354,9 @@ export class Slicer {
           }
         } else {
           if (silenceTimerSec > 0) {
-            await feedEncoder(this.mergeChannelChunks(pendingSilenceBuffer));
             pendingSilenceBuffer = [];
             silenceTimerSec = 0;
           }
-          await feedEncoder(windowChannels);
           captureShortSongWindow(windowChannels, windowDuration);
         }
       }
@@ -462,13 +443,10 @@ export class Slicer {
       const currentTime = totalSamplesProcessed / sampleRate;
       const openSongTrack = getCurrentSongTrack();
       if (openSongTrack) {
-        if (silenceTimerSec > 0 && this.hasChannelChunks(pendingSilenceBuffer)) {
-          await feedEncoder(this.mergeChannelChunks(pendingSilenceBuffer));
-        }
         openSongTrack.endTime = currentTime;
         openSongTrack.duration = currentTime - songStartSec;
         nextTrackIndex++;
-        await finishTrackEncoder(openSongTrack);
+        this.observer.onTrackUpdated?.(openSongTrack);
         currentSongTrack = null;
       } else if (currentState === 'SILENCE' && this.hasChannelChunks(currentSilenceBuffer)) {
         const silenceDuration = currentTime - silenceStartSec;
@@ -492,7 +470,6 @@ export class Slicer {
       this.patchState({ status: 'idle' });
       throw error;
     } finally {
-      abortTrackEncoder();
       this.patchState({ status: 'done', dbLevel: -100 });
     }
 
@@ -626,30 +603,6 @@ export class Slicer {
       return 1;
     }
     return Math.max(1, Math.floor(value ?? 1));
-  }
-
-  private getMp3ExportChannelCount(sourceChannels: number): number {
-    if (sourceChannels <= 1) {
-      return 1;
-    }
-    return sourceChannels === 2 ? 2 : 1;
-  }
-
-  private normalizeChannelsForMp3(channelsData: Float32Array[]): Float32Array[] {
-    if (channelsData.length <= 2) {
-      return channelsData;
-    }
-    const sampleCount = channelsData[0]?.length ?? 0;
-    const mono = new Float32Array(sampleCount);
-    for (const channel of channelsData) {
-      for (let i = 0; i < sampleCount; i++) {
-        mono[i] += channel[i];
-      }
-    }
-    for (let i = 0; i < sampleCount; i++) {
-      mono[i] /= channelsData.length;
-    }
-    return [mono];
   }
 
   private alignBufferWindows(leftover: Float32Array[], incoming: Float32Array[], windowSize: number): { ready: Float32Array[]; leftover: Float32Array[] } {

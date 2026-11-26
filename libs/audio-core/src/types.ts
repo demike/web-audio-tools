@@ -13,8 +13,10 @@ export interface Track {
   startTime: number;
   endTime: number;
   duration: number;
-  /** Encoded MP3 bytes. Populated once encoding finishes. */
+  /** Encoded MP3 bytes. Populated by the on-demand Export stage, not slicing. */
   mp3Bytes: Uint8Array | null;
+  /** Actual processed duration (incl. reverb tail); set by Export. Boundaries stay sliced. */
+  processedDuration?: number;
   transcription: string | null;
   status: 'pending' | 'encoding' | 'done' | 'failed';
 }

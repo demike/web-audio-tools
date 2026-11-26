@@ -36,6 +36,7 @@ export interface SlicerToolTarget {
   getStateValue(): SlicerState;
   updateTrackTitle(trackId: number, title: string, titleSource?: TitleSource): void;
   removeTrackById(trackId: number): void;
+  applyExportResult(trackKey: number, mp3Bytes: Uint8Array | null, processedDurationSec?: number): void;
 }
 
 export interface SlicerToolHost {
@@ -45,6 +46,12 @@ export interface SlicerToolHost {
   /** Optional total size for progress estimation. */
   fileSize?(source: string): Promise<number | undefined>;
   musicBrainz?: MusicBrainzClient;
+  /**
+   * Optional on-demand Export: process a detected Track to MP3 through the
+   * shared effect path. When absent, export_tracks returns only Tracks that
+   * were already encoded by the host.
+   */
+  exportTrack?(track: Track): Promise<{ mp3Bytes: Uint8Array; durationSec: number } | null>;
 }
 
 function json(value: unknown): ToolResponse {
@@ -216,18 +223,31 @@ export function createSlicerTools(host: SlicerToolHost): ToolDefinition[] {
     },
     {
       name: 'export_tracks',
-      description: 'Return encoded MP3s as base64 for all completed tracks, with titles and timings.',
+      description: 'Export tracks to MP3 (on-demand processing through the selected effect path) and return them as base64, with titles and timings.',
       inputSchema: { type: 'object', properties: {} },
-      execute: async () => json(
-        host.slicer.getTracksValue()
-          .filter(t => t.mp3Bytes !== null)
-          .map(t => ({
-            id: t.id,
-            title: t.title,
-            durationSeconds: round2(t.duration),
-            mp3Base64: bytesToBase64(t.mp3Bytes as Uint8Array)
-          }))
-      )
+      execute: async () => {
+        const tracks = host.slicer.getTracksValue();
+        if (host.exportTrack) {
+          for (const track of tracks) {
+            if (!track.mp3Bytes) {
+              const result = await host.exportTrack(track);
+              if (result) {
+                host.slicer.applyExportResult(track.key, result.mp3Bytes, result.durationSec);
+              }
+            }
+          }
+        }
+        return json(
+          tracks
+            .filter(t => t.mp3Bytes !== null)
+            .map(t => ({
+              id: t.id,
+              title: t.title,
+              durationSeconds: round2(t.processedDuration ?? t.duration),
+              mp3Base64: bytesToBase64(t.mp3Bytes as Uint8Array)
+            }))
+        );
+      }
     }
   ];
 }
